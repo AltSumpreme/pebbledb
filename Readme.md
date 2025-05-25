@@ -13,7 +13,7 @@ PebbleDB is a simple, in-memory key-value database built in Go. It provides a ba
 
 ### Prerequisites
 
-- Go 1.16+ installed on your machine.
+- Go 1.20+ installed on your machine.
 
 ### Installation
 
