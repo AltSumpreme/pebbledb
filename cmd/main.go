@@ -11,6 +11,8 @@ import (
 func main() {
 	store := pebbledb.NewStore()
 
+	go pebbledb.WaitForShutdown(pebbledb.Cleanup(store))
+
 	fmt.Println("Welcome to PebbleDB! Type Exit to quit.")
 	reader := bufio.NewReader(os.Stdin)
 	for {

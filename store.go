@@ -87,3 +87,12 @@ func (s *Store) Delete(key string) bool {
 	}
 	return exists
 }
+
+func (s *Store) Close() {
+	if err := s.logFile.Close(); err != nil {
+		s.logger.Printf("Error closing log file: %v", err)
+	} else {
+		s.logger.Println("Log file closed successfully.")
+
+	}
+}
