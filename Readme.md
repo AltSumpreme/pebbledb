@@ -2,6 +2,15 @@
 
 PebbleDB is a simple, in-memory key-value database built in Go. It provides a basic command-line interface (CLI) for performing CRUD (Create, Read, Update, Delete) operations on key-value pairs. This toy database is designed to help users understand the core concepts of databases and key-value storage systems.
 
+
+> [!WARNING]
+> 
+> PebbleDB is a WIP
+> 
+> Most aspects of the project are under heavy development
+> and no stable release is present as of yet.
+> 
+
 ## Features
 
 - **Set**: Store key-value pairs.
