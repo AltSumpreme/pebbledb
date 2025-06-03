@@ -42,3 +42,13 @@ Once the application is running, you can interact with it via the command line.
 - **EXIT**: Exit the database.
 
 
+## Future Plans
+
+- [x] **Persistence Layer**: Add the ability to persist data
+- [ ] **Concurrency Support**: Add support for concurrent access with read-write locks.
+- [ ] **Additional Commands**: Implement `UPDATE` and `LIST` commands.
+- [ ] **Data Types**: Support storing complex data types like arrays and structs.
+- [ ] **Performance Optimization**: Improve memory usage and introduce indexing.
+- [ ] **CLI Enhancements**: Add interactive mode and command history.
+- [ ] **Error Handling**: Enhance error handling for graceful recovery.
+- [ ] **Testing and Documentation**: Add unit tests and comprehensive documentation.
