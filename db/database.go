@@ -1,6 +1,8 @@
 package db
 
-import "fmt"
+import (
+	"fmt"
+)
 
 type Database struct {
 	Tables map[string]*Table
@@ -61,4 +63,24 @@ func (db *Database) SelectAll(tableName string) ([]Row, error) {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
 	return table.Rows, nil
+}
+
+func (db *Database) SelectColumns(tableName string, columns []Column) ([]Row, error) {
+	table, exists := db.Tables[tableName]
+	if !exists {
+		return nil, fmt.Errorf("table %s does not exist", tableName)
+	}
+	var result []Row
+	for _, row := range table.Rows {
+		selectedRow := Row{}
+		for _, col := range columns {
+			if value, ok := row[col.Name]; ok {
+				selectedRow[col.Name] = value
+			} else {
+				return nil, fmt.Errorf("column %s does not exist in table %s", col.Name, tableName)
+			}
+		}
+		result = append(result, selectedRow)
+	}
+	return result, nil
 }
