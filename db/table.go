@@ -14,7 +14,8 @@ func (t *Table) Insert(values []string) error {
 	if len(values) != len(t.Columns) {
 		return fmt.Errorf("number of values does not match number of columns")
 	}
-	t.Rows = append(t.Rows, Row{})
+	row := make(Row)
+
 	for i, col := range t.Columns {
 		switch col.Type {
 		case TypeInt:
@@ -23,7 +24,7 @@ func (t *Table) Insert(values []string) error {
 			if err != nil {
 				return fmt.Errorf("invalid value for column %s: %s", col.Name, values[i])
 			}
-			t.Rows[len(t.Rows)-1][col.Name] = intValue
+			row[col.Name] = intValue
 
 		case TypeString:
 			var strValue string
@@ -31,8 +32,11 @@ func (t *Table) Insert(values []string) error {
 			if err != nil {
 				return fmt.Errorf("invalid value for column %s: %s", col.Name, values[i])
 			}
-			t.Rows[len(t.Rows)-1][col.Name] = strValue
+			row[col.Name] = strValue
+		default:
+			return fmt.Errorf("unsupported column type %s for column %s", col.Type, col.Name)
 		}
 	}
+	t.Rows = append(t.Rows, row)
 	return nil
 }
