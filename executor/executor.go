@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"fmt"
 	"pebbledb/db"
 	"pebbledb/parser"
+	"pebbledb/storage"
 )
 
 type ExecutionResult struct {
@@ -11,7 +13,7 @@ type ExecutionResult struct {
 	Error   error
 }
 
-func ExecuteCommand(command parser.Command, database *db.Database) *ExecutionResult {
+func ExecuteCommand(command *parser.Command, database *db.Database) *ExecutionResult {
 	var rows []db.Row
 	var err error
 	switch command.Type {
@@ -19,19 +21,29 @@ func ExecuteCommand(command parser.Command, database *db.Database) *ExecutionRes
 		if err = database.CreateTable(command.Tablename, command.Columns); err != nil {
 			return &ExecutionResult{Error: err}
 		}
+		storage.SaveToDisk(database)
 		return &ExecutionResult{Message: "Table created successfully"}
 	case parser.CommandTypeInsert:
 		if err = database.InsertValue(command.Tablename, command.Values); err != nil {
 			return &ExecutionResult{Error: err}
 		}
+		storage.SaveToDisk(database)
 		return &ExecutionResult{Message: "Value inserted successfully"}
 	case parser.CommandTypeSelect:
-		var rows []db.Row
-		var err error
-		if len(command.Columns) == 1 && command.Columns[0].Name == "*" {
+
+		latestDB, err := storage.LoadFromDisk()
+		if err != nil {
+			return &ExecutionResult{Error: err}
+		}
+		*database = *latestDB
+		if command.AllColumns {
 			rows, err = database.SelectAll(command.Tablename)
 			if err != nil {
+				fmt.Println("Error selecting all columns:", err)
 				return &ExecutionResult{Error: err}
+			}
+			if len(rows) == 0 {
+				return &ExecutionResult{Message: "No rows found"}
 			}
 		} else {
 			rows, err = database.SelectColumns(command.Tablename, command.Columns)
@@ -43,6 +55,9 @@ func ExecuteCommand(command parser.Command, database *db.Database) *ExecutionRes
 			}
 
 		}
+		fmt.Printf("Returning %d rows from ExecuteCommand\n", len(rows))
+
+		return &ExecutionResult{Message: "Query executed successfully", Rows: rows}
 	}
-	return &ExecutionResult{Rows: rows}
+	return &ExecutionResult{Error: fmt.Errorf("unsupported command type: %s", command.Type)}
 }

@@ -17,10 +17,11 @@ const (
 )
 
 type Command struct {
-	Type      CommandType
-	Tablename string
-	Columns   []db.Column
-	Values    []string
+	Type       CommandType
+	Tablename  string
+	Columns    []db.Column
+	Values     []string
+	AllColumns bool
 }
 
 func Parse(input string) (*Command, error) {
@@ -65,11 +66,11 @@ func Parse(input string) (*Command, error) {
 		}, nil
 	case "INSERT":
 		// e.g., INSERT TO TABLE table_name (col1, col2) VALUES (val1, val2)
-		if len(tokens) < 6 || tokens[1] != "TO" || tokens[2] != "TABLE" || tokens[4] != "VALUES" {
+		if len(tokens) < 7 || tokens[1] != "TO" || tokens[2] != "TABLE" || tokens[5] != "VALUES" {
 			return nil, errors.New("invalid INSERT command")
 		}
 		tableName := tokens[3]
-		colToken := strings.Trim(tokens[5], "()")
+		colToken := strings.Trim(tokens[4], "()")
 		colParts := strings.Split(colToken, ",")
 		var vals []string
 		if len(tokens) > 6 {
@@ -97,24 +98,25 @@ func Parse(input string) (*Command, error) {
 
 	case "SELECT":
 		// e.g., SELECT col1, col2 FROM table_name
-		if len(tokens) < 5 || tokens[2] != "FROM" {
+		if len(tokens) < 4 || tokens[2] != "FROM" {
 			return nil, errors.New("invalid SELECT command")
 		}
 		var cols []db.Column
+		var allcols bool
 		if tokens[1] == "*" {
-			cols = []db.Column{{Name: "*", Type: db.TypeString}}
+			allcols = true
 		} else {
 			for _, col := range strings.Split(tokens[1], ",") {
 				cols = append(cols, db.Column{
 					Name: col,
-					Type: db.TypeString,
 				})
 			}
 		}
 		return &Command{
-			Type:      CommandTypeSelect,
-			Tablename: tokens[3],
-			Columns:   cols,
+			Type:       CommandTypeSelect,
+			Tablename:  tokens[3],
+			Columns:    cols,
+			AllColumns: allcols,
 		}, nil
 	case "DELETE":
 		// e.g., DELETE FROM table_name WHERE condition

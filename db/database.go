@@ -2,10 +2,11 @@ package db
 
 import (
 	"fmt"
+	"strings"
 )
 
 type Database struct {
-	Tables map[string]*Table
+	Tables map[string]*Table `json:"tables"`
 }
 
 func NewDatabase() *Database {
@@ -66,6 +67,7 @@ func (db *Database) SelectAll(tableName string) ([]Row, error) {
 }
 
 func (db *Database) SelectColumns(tableName string, columns []Column) ([]Row, error) {
+	tableName = strings.ToUpper(strings.TrimSpace(tableName))
 	table, exists := db.Tables[tableName]
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)

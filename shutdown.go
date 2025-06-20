@@ -15,12 +15,3 @@ func WaitForShutdown(cleanup func()) {
 	log.Printf("Received shutdown signal, closing PebbleDB...")
 	cleanup()
 }
-
-func Cleanup(store *Store) func() {
-	return func() {
-		store.Close()
-		log.Println("Cleanup completed. PebbleDB is now closed.")
-		os.Exit(0)
-	}
-
-}
