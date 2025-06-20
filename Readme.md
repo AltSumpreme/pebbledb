@@ -1,6 +1,6 @@
 # PebbleDB
 
-PebbleDB is a simple, in-memory key-value database built in Go. It provides a basic command-line interface (CLI) for performing CRUD (Create, Read, Update, Delete) operations on key-value pairs. This toy database is designed to help users understand the core concepts of databases and key-value storage systems.
+PebbleDB is a simple,lightweight modular database being built in Go. It provides a SQL-like interface,an in-memory engine,and disk persistence via JSON files.
 
 
 > [!WARNING]
@@ -13,10 +13,13 @@ PebbleDB is a simple, in-memory key-value database built in Go. It provides a ba
 
 ## Features
 
-- **Set**: Store key-value pairs.
-- **Get**: Retrieve values by keys.
-- **Delete**: Remove key-value pairs.
-- **Exit**: Exit the application.
+- **SQL-like REPL**: SQL-like command parsing and execution
+- **Engine Abstraction** :  Engine handles orchestration between parser, executor, and storage.
+- **JSON Persistence** : Data persists to disk in JSON format.
+- **Page Management** : Introduced fixed-size 4KB page abstraction.
+- **Test Coverage** : Initial unit tests for core DB operations.
+
+
 
 ## Getting Started
 
@@ -45,15 +48,36 @@ Once the application is running, you can interact with it via the command line.
 
 #### Commands
 
-- **SET `<key>` `<value>`**: Store a key-value pair.
-- **GET `<key>`**: Retrieve the value for the given key.
-- **DELETE `<key>`**: Delete a key-value pair.
+- **CREATE**: 
+```bash
+CREATE TABLE table_name column_name:column type
+```
+- **INSERT**
+```bash
+INSERT TO TABLE table_name (col1,col2) FROM VALUES (val1,val2)
+```
+**SELECT**
+-To Select ALL Columns
+```bash
+SELECT * FROM table_name
+```
+- Select Specific Columns
+
+```bash
+SELECT col1,col2 FROM table_name
+```
+
+-**DROP**
+```bash
+DROP TABLE table_name
+```
 - **EXIT**: Exit the database.
 
 
 ## Future Plans
 
 - [x] **Persistence Layer**: Add the ability to persist data
+- [ ] **Adding a WAL**
 - [ ] **Concurrency Support**: Add support for concurrent access with read-write locks.
 - [ ] **Additional Commands**: Implement `UPDATE` and `LIST` commands.
 - [ ] **Data Types**: Support storing complex data types like arrays and structs.
@@ -61,3 +85,16 @@ Once the application is running, you can interact with it via the command line.
 - [ ] **CLI Enhancements**: Add interactive mode and command history.
 - [ ] **Error Handling**: Enhance error handling for graceful recovery.
 - [ ] **Testing and Documentation**: Add unit tests and comprehensive documentation.
+
+
+#### Testing
+```bash
+cd testing
+go test
+
+```
+
+**For more verbose output**
+```bash
+go test -v
+```

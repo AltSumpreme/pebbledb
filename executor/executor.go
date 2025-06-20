@@ -58,6 +58,13 @@ func ExecuteCommand(command *parser.Command, database *db.Database) *ExecutionRe
 		fmt.Printf("Returning %d rows from ExecuteCommand\n", len(rows))
 
 		return &ExecutionResult{Message: "Query executed successfully", Rows: rows}
+
+	case parser.CommandTypeDrop:
+		if err = database.DropTable(command.Tablename); err != nil {
+			return &ExecutionResult{Error: err}
+		}
+		storage.SaveToDisk(database)
+		return &ExecutionResult{Message: "Table dropped successfully"}
 	}
-	return &ExecutionResult{Error: fmt.Errorf("unsupported command type: %s", command.Type)}
+	return &ExecutionResult{Error: fmt.Errorf("unknown command type: %s", command.Type)}
 }
