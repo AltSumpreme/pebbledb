@@ -56,18 +56,21 @@ CREATE TABLE table_name column_name:column type
 ```bash
 INSERT TO TABLE table_name (col1,col2) FROM VALUES (val1,val2)
 ```
-**SELECT**
+- **SELECT**
+
+
 -To Select ALL Columns
 ```bash
 SELECT * FROM table_name
 ```
+
 - Select Specific Columns
 
 ```bash
 SELECT col1,col2 FROM table_name
 ```
 
--**DROP**
+- **DROP**
 ```bash
 DROP TABLE table_name
 ```
