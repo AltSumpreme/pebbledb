@@ -79,15 +79,15 @@ DROP TABLE table_name
 
 ## Future Plans
 
-- [x] **Persistence Layer**: Add the ability to persist data
-- [ ] **Adding a WAL**
-- [ ] **Concurrency Support**: Add support for concurrent access with read-write locks.
-- [ ] **Additional Commands**: Implement `UPDATE` and `LIST` commands.
-- [ ] **Data Types**: Support storing complex data types like arrays and structs.
-- [ ] **Performance Optimization**: Improve memory usage and introduce indexing.
-- [ ] **CLI Enhancements**: Add interactive mode and command history.
-- [ ] **Error Handling**: Enhance error handling for graceful recovery.
-- [ ] **Testing and Documentation**: Add unit tests and comprehensive documentation.
+- [] **Persistence Layer**: Add the ability to persist data
+- [] **WAL**: Adding WAL and it support to the later releases
+- [] **Concurrency Support**: Add support for concurrent access with read-write locks.
+- [] **Additional Commands**: Implement `UPDATE` and `LIST` commands.
+- [] **Data Types**: Support storing complex data types like arrays and structs.
+- [] **Performance Optimization**: Improve memory usage and introduce indexing.
+- [] **CLI Enhancements**: Add interactive mode and command history.
+- [] **Error Handling**: Enhance error handling for graceful recovery.
+- [] **Testing and Documentation**: Add unit tests and comprehensive documentation.
 
 
 #### Testing
