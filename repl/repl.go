@@ -16,7 +16,7 @@ func ReplInit(database *db.Database) {
 	fmt.Println("Welcome to PebbleDB ! Type 'Exit' to quit.")
 
 	for {
-		fmt.Println("> ")
+		fmt.Print("> ")
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 		if input == "" {

@@ -9,13 +9,13 @@ import (
 
 type Engine struct {
 	DB    *db.Database
-	Pager *pager.Pager
+	Pager *pager.Page
 }
 
 func NewEngine() (*Engine, error) {
 
 	var database *db.Database
-	if _, err := os.Stat(storage.Path); err == nil {
+	if _, err := os.Stat(storage.DBDir); err == nil {
 		database, err = storage.LoadFromDisk()
 		if err != nil {
 			return nil, err
@@ -25,11 +25,11 @@ func NewEngine() (*Engine, error) {
 	} else {
 		return nil, err
 	}
-	pagerFile, err := os.OpenFile(storage.Path, os.O_RDWR|os.O_CREATE, 0666)
+	err := os.MkdirAll(storage.DBDir, 0775)
 	if err != nil {
 		return nil, err
 	}
-	pgr := pager.PagerInit(pagerFile)
+	pgr := pager.NewPage()
 	if pgr == nil {
 		return nil, err
 	}
@@ -46,5 +46,6 @@ func (engine *Engine) Close() error {
 	if err := storage.SaveToDisk(engine.DB); err != nil {
 		return err
 	}
-	return engine.Pager.Close()
+
+	return nil
 }

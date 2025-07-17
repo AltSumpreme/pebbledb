@@ -6,7 +6,7 @@ import (
 )
 
 type Database struct {
-	Tables map[string]*Table `json:"tables"`
+	Tables map[string]*Table
 }
 
 func NewDatabase() *Database {

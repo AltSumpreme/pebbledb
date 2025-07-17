@@ -8,14 +8,14 @@ const (
 )
 
 type Column struct {
-	Name string    `json:"name"`
-	Type FieldType `json:"type"`
+	Name string
+	Type FieldType
 }
 
 type Row map[string]interface{}
 
 type Table struct {
-	Name    string   `json:"name"`
-	Columns []Column `json:"columns"`
-	Rows    []Row    `json:"rows"`
+	Name    string
+	Columns []Column
+	Rows    []Row
 }
