@@ -57,26 +57,23 @@ func (p *Page) InsertTuple(record []byte) (int, error) {
 		return -1, errors.New("record cannot be empty")
 	}
 	if p.Header.NumItems >= MaxItemsPerPage {
-		return -1, errors.New("page is full")
+		return -2, errors.New("page is full")
 	}
 
-	// 🧠 Calculate available free space
 	freeSpace := int(p.Header.PdUpper) - int(p.Header.PdLower)
 	requiredSpace := len(record) + ItemIDSize
 	if requiredSpace > freeSpace {
 		return -1, errors.New("not enough space in page")
 	}
 
-	// 👇 Insert the record at the top
 	newUpper := p.Header.PdUpper - uint16(len(record))
 	copy(p.Data[newUpper:], record)
 
-	// 👇 Add the metadata for this tuple
 	slot := int(p.Header.NumItems)
 	p.Items[slot] = ItemID{
 		Offset:      newUpper,
 		Length:      uint16(len(record)),
-		DeletedFlag: 1,
+		DeletedFlag: 1, // Mark as not deleted
 	}
 
 	p.Header.PdUpper = newUpper
