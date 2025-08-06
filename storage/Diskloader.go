@@ -69,7 +69,7 @@ func LoadFromDisk() (*db.Database, error) {
 				if err != nil {
 					return nil, fmt.Errorf("failed to read tuple %d from page: %w", i, err)
 				}
-				deserialized, err := pager.DeserializeRow(tupleData, columnDef)
+				deserialized, err := db.DeserializeRow(tupleData, columnDef)
 				if err != nil {
 					return nil, fmt.Errorf("failed to deserialize row from tuple %d: %w", i, err)
 				}

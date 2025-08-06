@@ -2,7 +2,6 @@ package db
 
 import (
 	"fmt"
-	"strings"
 )
 
 type Database struct {
@@ -63,9 +62,10 @@ func (db *Database) SelectAll(tableName string) ([]Row, error) {
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
 	}
-	return table.Rows, nil
+	return table.Select([]Column{{Name: "*"}})
 }
 
+/*
 func (db *Database) SelectColumns(tableName string, columns []Column) ([]Row, error) {
 	tableName = strings.ToUpper(strings.TrimSpace(tableName))
 	table, exists := db.Tables[tableName]
@@ -86,3 +86,13 @@ func (db *Database) SelectColumns(tableName string, columns []Column) ([]Row, er
 	}
 	return result, nil
 }
+
+func (db *Database) DeleteRow(tableName string, rowIndex int) error {
+	table, exists := db.Tables[tableName]
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tableName)
+	}
+
+}
+
+*/

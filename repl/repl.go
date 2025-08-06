@@ -44,7 +44,7 @@ func ReplInit(database *db.Database) {
 			continue
 		} else if len(result.Rows) > 0 {
 			for _, row := range result.Rows {
-				for colName, value := range row {
+				for colName, value := range row.Value {
 					fmt.Printf("%s: %v ", colName, value)
 				}
 				fmt.Println()

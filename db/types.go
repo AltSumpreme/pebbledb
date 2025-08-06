@@ -1,5 +1,7 @@
 package db
 
+import "pebbledb/pagemanager"
+
 type FieldType string
 
 const (
@@ -12,10 +14,18 @@ type Column struct {
 	Type FieldType
 }
 
-type Row map[string]interface{}
+type TuplePointer struct {
+	PageID int
+	Offset int
+}
+type Row struct {
+	Value        map[string]interface{}
+	TuplePointer *TuplePointer
+}
 
 type Table struct {
-	Name    string
-	Columns []Column
-	Rows    []Row
+	Name        string
+	Columns     []Column
+	PageNo      []int
+	PageManager *pagemanager.PageManager
 }

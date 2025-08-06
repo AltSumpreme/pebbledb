@@ -32,7 +32,7 @@ func SaveToDisk(database *db.Database) error {
 		currentPage := pager.NewPage()
 		for _, row := range table.Rows {
 			fmt.Printf("Serializing row: %v\n", row)
-			serialized, err := pager.SerializeRow(row, table.Columns)
+			serialized, err := db.SerializeRow(row, table.Columns)
 			fmt.Printf("Serialized row: %v\n", serialized)
 			if err != nil {
 				return fmt.Errorf("serialize row: %w", err)
