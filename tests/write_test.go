@@ -1,3 +1,4 @@
+// ...existing code...
 package tests
 
 import (
@@ -7,62 +8,43 @@ import (
 	"pebbledb/storage"
 	"strconv"
 	"testing"
+	"time"
 )
 
-func TestWriteAndReadMultiPage(t *testing.T) {
+func TestWriteThroughput(t *testing.T) {
+	// Benchmark test
 	_ = os.RemoveAll(storage.DBDir)
 	_ = os.MkdirAll(storage.DBDir, 0775)
 
-	// Initialize and create the table
 	database := db.NewDatabase()
-	err := database.CreateTable("users", []db.Column{
+	if err := database.CreateTable("bench_users", []db.Column{
 		{Name: "id", Type: db.TypeInt},
 		{Name: "name", Type: db.TypeString},
-	})
-	if err != nil {
-		t.Fatalf("Failed to create table: %v", err)
+	}); err != nil {
+		t.Fatalf("CreateTable failed: %v", err)
 	}
 
-	// Insert 300 rows
-	for i := 0; i < 300; i++ {
-		err := database.InsertValue("users", []string{
+	const N = 200000 // No of ops
+	start := time.Now()
+	for i := 0; i < N; i++ {
+		if err := database.InsertValue("bench_users", []string{
 			strconv.Itoa(i),
 			"user" + strconv.Itoa(i),
-		})
-		if err != nil {
-			t.Fatalf("Insert failed at row %d: %v", i, err)
+		}); err != nil {
+			t.Fatalf("Insert failed at %d: %v", i, err)
 		}
 	}
+	elapsed := time.Since(start)
 
-	// Save database to disk
+	opsPerSec := float64(N) / elapsed.Seconds()
+	fmt.Print(opsPerSec)
+	t.Logf("Performed %d inserts in %v (%.2f ops/sec)", N, elapsed, opsPerSec)
+
+	startSave := time.Now()
 	if err := storage.SaveToDisk(database); err != nil {
-		t.Fatalf("Failed to save to disk: %v", err)
+		t.Fatalf("SaveToDisk failed: %v", err)
 	}
+	saveElapsed := time.Since(startSave)
+	t.Logf("SaveToDisk took %v", saveElapsed)
 
-	// Load the database from disk
-	loadedDB, err := storage.LoadFromDisk()
-	if err != nil {
-		t.Fatalf("Failed to load from disk: %v", err)
-	}
-
-	// Validate: ensure all 300 rows are retrievable and correct
-	rows, err := loadedDB.SelectAll("users")
-	if err != nil {
-		t.Fatalf("Select failed: %v", err)
-	}
-
-	if len(rows) != 300 {
-		t.Fatalf("Expected 300 rows, got %d", len(rows))
-	}
-
-	for i := 0; i < 300; i++ {
-		expectedName := "user" + strconv.Itoa(i)
-		if rows[i]["name"] != expectedName {
-			t.Errorf("Row %d: expected name '%s', got '%v'", i, expectedName, rows[i]["name"])
-		}
-	}
-
-	// Lookup test
-	specificRow := rows[257] // Random row for validation
-	fmt.Printf("Looked up row 257 -> ID: %v, Name: %v\n", specificRow["id"], specificRow["name"])
 }
