@@ -45,7 +45,7 @@ func ExecuteCommand(command *parser.Command, database *db.Database) *ExecutionRe
 			if len(rows) == 0 {
 				return &ExecutionResult{Message: "No rows found"}
 			}
-		} else {
+		} /*else {
 			rows, err = database.SelectColumns(command.Tablename, command.Columns)
 			if err != nil {
 				return &ExecutionResult{Error: err}
@@ -54,7 +54,7 @@ func ExecuteCommand(command *parser.Command, database *db.Database) *ExecutionRe
 				return &ExecutionResult{Message: "No rows found"}
 			}
 
-		}
+		} */
 		fmt.Printf("Returning %d rows from ExecuteCommand\n", len(rows))
 
 		return &ExecutionResult{Message: "Query executed successfully", Rows: rows}

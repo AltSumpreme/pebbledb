@@ -106,6 +106,22 @@ func (p *Page) DeleteTuple(slot int) error {
 	return nil
 }
 
+func (p *Page) GetAllTuples() ([][]byte, error) {
+
+	var tuples [][]byte
+
+	for i := 0; i < int(p.Header.NumItems); i++ {
+		item := p.Items[i]
+		if item.DeletedFlag == 0 {
+			continue
+		}
+		data := make([]byte, item.Length)
+		copy(data, p.Data[item.Offset:item.Offset+item.Length])
+		tuples = append(tuples, data)
+	}
+	return tuples, nil
+}
+
 func SerializePage(page *Page) []byte {
 	buf := make([]byte, PageSize)
 	writer := bytes.NewBuffer(buf[:0])

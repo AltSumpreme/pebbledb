@@ -3,7 +3,6 @@ package pebbledb
 import (
 	"os"
 	"pebbledb/db"
-	"pebbledb/pagemanager"
 	"pebbledb/pager"
 	"pebbledb/storage"
 )
@@ -16,7 +15,6 @@ type Engine struct {
 func NewEngine() (*Engine, error) {
 
 	var database *db.Database
-	pm := pagemanager.NewPageManager()
 	if _, err := os.Stat(storage.DBDir); err == nil {
 		database, err = storage.LoadFromDisk()
 		if err != nil {

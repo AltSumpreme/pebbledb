@@ -7,13 +7,17 @@ import (
 	"strconv"
 )
 
+// Initializes a new table with the given name and columns.
 func NewTable(name string, columns []Column) *Table {
 	return &Table{
-		Name:    name,
-		Columns: columns,
+		Name:        name,
+		Columns:     columns,
+		PageNo:      []int{},
+		PageManager: pagemanager.NewPageManager(make(map[int]string), 0),
 	}
 }
 
+// This is the insert function for the Table struct.
 func (t *Table) Insert(values []string) (*Row, error) {
 
 	if len(t.Columns) != len(values) {
@@ -42,7 +46,10 @@ func (t *Table) Insert(values []string) (*Row, error) {
 	}
 
 	for _, pageID := range t.PageNo {
-		page := pagemanager.NewPageManager().GetPage(pageID)
+		page, err := t.PageManager.GetPage(pageID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get page %d: %v", pageID, err)
+		}
 		if offset, err := page.InsertTuple(serializedData); err == nil {
 			return &Row{
 				Value: rowData,
@@ -61,6 +68,7 @@ func (t *Table) Insert(values []string) (*Row, error) {
 	}
 
 	t.PageNo = append(t.PageNo, pageID)
+
 	return &Row{
 		Value: rowData,
 		TuplePointer: &TuplePointer{
@@ -70,6 +78,7 @@ func (t *Table) Insert(values []string) (*Row, error) {
 	}, nil
 }
 
+// Selects all rows from the table.
 func (t *Table) Select(cols []Column) ([]Row, error) {
 
 	if len(cols) != 1 || cols[0].Name != "*" {
@@ -79,7 +88,10 @@ func (t *Table) Select(cols []Column) ([]Row, error) {
 	var results []Row
 
 	for _, pageID := range t.PageNo {
-		page := t.PageManager.GetPage(pageID)
+		page, err := t.PageManager.GetPage(pageID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get page %d: %v", pageID, err)
+		}
 		for slot := 0; slot < int(page.Header.NumItems); slot++ {
 			data, err := page.ReadTuple(slot)
 			if err != nil {

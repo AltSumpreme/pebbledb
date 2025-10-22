@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"pebbledb/db"
-	"pebbledb/pager"
+	"pebbledb/pagemanager"
 	"strings"
 )
 
@@ -33,51 +33,32 @@ func LoadFromDisk() (*db.Database, error) {
 		}
 	}
 
-	for tableName, pageFile := range tablesMap {
+	for tableName, pageFiles := range tablesMap {
 		columnDef, err := LoadSchemaFromDisk(tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load schema for table %s: %w", tableName, err)
 		}
+
+		// Build pageFiles for page manager   index -> filepath
+		pageFileMap := make(map[int]string)
+		for idx, filename := range pageFiles {
+			pagePath := filepath.Join(DBDir, filename)
+			pageFileMap[idx] = pagePath
+		}
+
+		pm := pagemanager.NewPageManager(pageFileMap, 0)
+
 		table := db.Table{
-			Name:    tableName,
-			Columns: columnDef,
-			Rows:    []db.Row{},
+			Name:        tableName,
+			Columns:     columnDef,
+			PageManager: pm,
+			PageNo:      make([]int, 0, len(pageFiles)),
 		}
 
-		for _, files := range pageFile {
-			path := filepath.Join(DBDir, files)
-			file, err := os.Open(path)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open file %s: %w", path, err)
-			}
-			buf := make([]byte, pager.PageSize)
-			_, err = file.Read(buf)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read file %s: %w", path, err)
-			}
-
-			page, err := pager.DeserializePage(buf)
-			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize page from file %s: %w", path, err)
-			}
-			for i := 0; i < pager.MaxItemsPerPage; i++ {
-				if page.Items[i].DeletedFlag == 0 || page.Items[i].Length == 0 {
-					continue
-				}
-
-				tupleData, err := page.ReadTuple(i)
-				if err != nil {
-					return nil, fmt.Errorf("failed to read tuple %d from page: %w", i, err)
-				}
-				deserialized, err := db.DeserializeRow(tupleData, columnDef)
-				if err != nil {
-					return nil, fmt.Errorf("failed to deserialize row from tuple %d: %w", i, err)
-				}
-				table.Rows = append(table.Rows, deserialized)
-
-			}
-
+		for idx := range pageFileMap {
+			table.PageNo = append(table.PageNo, idx)
 		}
+
 		database.Tables[tableName] = &table
 
 	}
