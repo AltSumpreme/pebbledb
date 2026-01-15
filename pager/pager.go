@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	PageSize         = 4096
+	PageSize         = 4096 //4KB
 	PageHeaderSize   = 16
 	ItemIDSize       = 6
 	MaxItemsPerPage  = 128
@@ -15,11 +15,20 @@ const (
 	DataRegionSize   = PageSize - PageHeaderSize - MaxItemsPerPage*ItemIDSize - SpecialSpaceSize
 )
 
+// Currently supports only the PageType table but will soon support the others.
+const (
+	PageTypeTable         uint8 = 1
+	PageTypeBTreeInternal       = 2
+	PageTypeBTreeLeaf           = 3
+	PageTypeRun                 = 4
+)
+
 type PageHeader struct {
 	LSN      uint64 // Future WAL support
 	NumItems uint16
 	PdLower  uint16
 	PdUpper  uint16
+	PageType uint8
 }
 
 type ItemID struct {
@@ -66,7 +75,12 @@ func (p *Page) InsertTuple(record []byte) (int, error) {
 	newUpper := p.Header.PdUpper - uint16(len(record))
 	copy(p.Data[newUpper:], record)
 
-	slot := int(p.Header.NumItems)
+	slot := p.findFreeSlot()
+	if slot == -1 {
+		slot = int(p.Header.NumItems)
+		p.Header.NumItems++
+		p.Header.PdLower += ItemIDSize
+	}
 	p.Items[slot] = ItemID{
 		Offset:      newUpper,
 		Length:      uint16(len(record)),
@@ -122,6 +136,15 @@ func (p *Page) GetAllTuples() ([][]byte, error) {
 	return tuples, nil
 }
 
+func (p *Page) findFreeSlot() int {
+	for i := 0; i < int(p.Header.NumItems); i++ {
+		if p.Items[i].DeletedFlag == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
 func SerializePage(page *Page) []byte {
 	buf := make([]byte, PageSize)
 	writer := bytes.NewBuffer(buf[:0])
@@ -173,4 +196,26 @@ func DeserializePage(buf []byte) (*Page, error) {
 		return nil, err
 	}
 	return page, nil
+}
+
+// Helper function to give telemetry regarding Page utilization
+
+func (p *Page) DataUtilization() float64 {
+	used := DataRegionSize - int(p.Header.PdUpper)
+	return float64(used) / float64(DataRegionSize)
+}
+
+func (p *Page) freeSpace() int {
+	return int(p.Header.PdUpper) - int(p.Header.PdLower)
+
+}
+
+func (p *Page) LiveDataSize() int {
+	var sum int
+	for i := 0; i < int(p.Header.NumItems); i++ {
+		if p.Items[i].DeletedFlag == 1 {
+			sum += int(p.Items[i].Length)
+		}
+	}
+	return sum
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"pebbledb/pagemanager"
+	"pebbledb/pager"
 	"strconv"
 )
 
@@ -110,4 +111,49 @@ func (t *Table) Select(cols []Column) ([]Row, error) {
 	}
 	return results, nil
 
+}
+
+func (t *Table) StorageUtilization() float64 {
+	if len(t.PageNo) == 0 {
+		return 0
+	}
+
+	var liveBytes int
+	var totalBytes int
+
+	for _, pid := range t.PageNo {
+		page, err := t.PageManager.GetPage(pid)
+		if err != nil {
+			continue
+		}
+		liveBytes += page.LiveDataSize()
+		totalBytes += pager.DataRegionSize
+	}
+
+	if totalBytes == 0 {
+		return 0
+	}
+	return float64(liveBytes) / float64(totalBytes)
+}
+
+func (t *Table) ActivePageUtilization() float64 {
+	var sum float64
+	var count int
+
+	for _, pid := range t.PageNo {
+		page, err := t.PageManager.GetPage(pid)
+		if err != nil {
+			continue
+		}
+
+		if page.LiveDataSize() > 0 {
+			sum += page.DataUtilization()
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
 }
