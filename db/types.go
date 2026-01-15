@@ -24,8 +24,9 @@ type Row struct {
 }
 
 type Table struct {
-	Name        string
-	Columns     []Column
-	PageNo      []int
-	PageManager *pagemanager.PageManager
+	Name         string
+	Columns      []Column
+	PageNo       []int
+	PageManager  *pagemanager.PageManager
+	FreeSpaceMap FSM
 }

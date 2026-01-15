@@ -17,6 +17,9 @@ func NewEngine() (*Engine, error) {
 	var database *db.Database
 	if _, err := os.Stat(storage.DBDir); err == nil {
 		database, err = storage.LoadFromDisk()
+		for _, table := range database.Tables {
+			table.RebuildFSM()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -29,6 +32,7 @@ func NewEngine() (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	pgr := pager.PageInit()
 	if pgr == nil {
 		return nil, err

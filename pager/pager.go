@@ -66,7 +66,7 @@ func (p *Page) InsertTuple(record []byte) (int, error) {
 		return -2, errors.New("page is full")
 	}
 
-	freeSpace := int(p.Header.PdUpper) - int(p.Header.PdLower)
+	freeSpace := p.FreeSpace()
 	requiredSpace := len(record) + ItemIDSize
 	if requiredSpace > freeSpace {
 		return -1, errors.New("not enough space in page")
@@ -205,11 +205,9 @@ func (p *Page) DataUtilization() float64 {
 	return float64(used) / float64(DataRegionSize)
 }
 
-func (p *Page) freeSpace() int {
+func (p *Page) FreeSpace() int {
 	return int(p.Header.PdUpper) - int(p.Header.PdLower)
-
 }
-
 func (p *Page) LiveDataSize() int {
 	var sum int
 	for i := 0; i < int(p.Header.NumItems); i++ {
