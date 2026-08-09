@@ -88,15 +88,18 @@ DROP TABLE table_name
 - [ ] **Error Handling**: Enhance error handling for graceful recovery.
 - [ ] **Testing and Documentation**: Add unit tests and comprehensive documentation.
 
+The long-term direction is a PostgreSQL-compatible distributed SQL database over
+an ordered LSM engine. See the [architecture and incremental build plan](docs/architecture.md)
+for layer boundaries, completed foundations, and milestone acceptance criteria.
+
 
 #### Testing
 ```bash
-cd testing
-go test
+go test ./...
 
 ```
 
 **For more verbose output**
 ```bash
-go test -v
+go test -v ./...
 ```
