@@ -74,9 +74,12 @@ tests for any persistent format it introduces.
    - 1A (implemented): WAL, memtable, SSTables, ordered scans, basic compaction.
    - 1B: sparse indexes, Bloom filters, block cache, background flush, leveled
      compaction, file manifest, directory locking, metrics, and fault injection.
-2. **Typed relational model and codecs**
-   - SQL `NULL`, `BOOL`, `INT`, `BIGINT`, `TEXT`, `DECIMAL`, and typed values.
-   - Stable key, row, and schema encodings with round-trip/order tests.
+2. **Typed relational model and codecs (implemented)**
+   - SQL `NULL`, `BOOL`, `INT`, `BIGINT`, `TEXT`, bounded exact `DECIMAL`, and
+     immutable typed values.
+   - Versioned order-preserving composite keys, deterministic rows keyed by
+     stable column IDs, and versioned table schemas with compatibility,
+     round-trip, ordering, LSM integration, and corruption tests.
 3. **Catalog**
    - Persistent databases, schemas, tables, columns, indexes, and constraints.
    - Transactional catalog operations, `SHOW TABLES`, and table description.
@@ -117,8 +120,8 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 2 starts with standalone `types`, `codec`, and `catalog` contracts. The
-first end-to-end vertical path will be:
+Milestone 3 starts with a persistent catalog over the `types`, `codec`, and LSM
+contracts. The first end-to-end vertical path will be:
 
 ```text
 CREATE TABLE -> catalog records in LSM
