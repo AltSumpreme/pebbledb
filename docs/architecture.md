@@ -107,9 +107,13 @@ tests for any persistent format it introduces.
    - Exact entry/distinct statistics and an initial optimizer that selects
      primary-key or selective single-column equality scans; chosen paths and
      index names appear in `EXPLAIN`.
-7. **MVCC and transactions**
-   - Timestamped row/index versions, snapshots, intents, atomic write batches,
-     conflict handling, recovery, and serializable validation.
+7. **MVCC and transactions (implemented)**
+   - Timestamped catalog/row/index versions, stable snapshots, buffered write
+     intents, and all-or-nothing checksummed WAL batches with restart recovery.
+   - Optimistic serializable validation covers write/write, point read/write,
+     and range phantom conflicts. SQL statements are atomic by default, while
+     `BEGIN`, `COMMIT`, and `ROLLBACK` provide multi-statement transactions with
+     read-your-writes behavior and aborted-transaction handling.
 8. **Ranges and routing**
    - Key-range descriptors, range-aware requests, splits, and a single-process
      multi-range test harness.
@@ -134,14 +138,14 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 6 starts with maintained secondary indexes, uniqueness enforcement,
-statistics, and optimizer access-path selection. The completed local path is:
+Milestone 8 introduces persistent key-range descriptors and a range router above
+MVCC. The completed local path is:
 
 ```text
-CREATE TABLE -> catalog records in LSM
-INSERT -> typed row encoded under a primary key
-SELECT by primary key -> ordered LSM lookup -> decoded row
+SQL statement -> serializable MVCC transaction
+              -> catalog + row + index versions in one WAL batch
+              -> ordered LSM storage
 ```
 
-Only after that path has restart tests should the legacy full-database snapshot
-writer be retired or migrated.
+Range boundaries will use the same bytewise logical key order, so routing does
+not leak into SQL semantics or the relational codecs.

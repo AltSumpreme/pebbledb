@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"pebbledb/storage/kv"
 )
 
 const walFilename = "wal.log"
@@ -64,7 +66,7 @@ func Open(directory string, supplied ...Options) (*Store, error) {
 		return nil, errors.New("lsm: SSTable generation space exhausted")
 	}
 
-	store.wal, err = openWriteAheadLog(filepath.Join(directory, walFilename), store.applyMemtable)
+	store.wal, err = openWriteAheadLog(filepath.Join(directory, walFilename), store.applyMemtableBatch)
 	if err != nil {
 		closeSSTables(tables)
 		return nil, err
@@ -107,6 +109,43 @@ func (store *Store) Delete(key []byte) error {
 		return err
 	}
 	store.applyMemtable(string(key), mutation{tombstone: true})
+	if store.memtableBytes >= store.options.MemtableSizeBytes {
+		return store.flushLocked()
+	}
+	return nil
+}
+
+// Apply durably installs every mutation as one atomic WAL record. Validation
+// happens before the record is written, and recovery never replays a partial
+// batch.
+func (store *Store) Apply(mutations []kv.Mutation) error {
+	if len(mutations) == 0 {
+		return nil
+	}
+	entries := make([]walMutation, len(mutations))
+	for index, current := range mutations {
+		if current.Delete {
+			if err := validateKey(current.Key); err != nil {
+				return fmt.Errorf("lsm: batch mutation %d: %w", index+1, err)
+			}
+			entries[index] = walMutation{key: cloneBytes(current.Key), entry: mutation{tombstone: true}}
+			continue
+		}
+		if err := validateKeyValue(current.Key, current.Value); err != nil {
+			return fmt.Errorf("lsm: batch mutation %d: %w", index+1, err)
+		}
+		entries[index] = walMutation{key: cloneBytes(current.Key), entry: mutation{value: cloneBytes(current.Value)}}
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	if err := store.wal.appendBatch(entries); err != nil {
+		return err
+	}
+	store.applyMemtableBatch(entries)
 	if store.memtableBytes >= store.options.MemtableSizeBytes {
 		return store.flushLocked()
 	}
@@ -325,6 +364,12 @@ func (store *Store) applyMemtable(key string, entry mutation) {
 	entry.value = cloneBytes(entry.value)
 	store.memtable[key] = entry
 	store.memtableBytes += mutationSize(key, entry)
+}
+
+func (store *Store) applyMemtableBatch(entries []walMutation) {
+	for _, current := range entries {
+		store.applyMemtable(string(current.key), current.entry)
+	}
 }
 
 func mutationSize(key string, entry mutation) int {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -14,16 +15,23 @@ import (
 const (
 	walPut              byte = 1
 	walDelete           byte = 2
+	walBatch            byte = 3
 	walHeaderSize            = 8
 	walRecordHeaderSize      = 8
+	maxWALBatchSize          = 256 << 20
 )
+
+type walMutation struct {
+	key   []byte
+	entry mutation
+}
 
 type writeAheadLog struct {
 	file *os.File
 	path string
 }
 
-func openWriteAheadLog(path string, apply func(string, mutation)) (*writeAheadLog, error) {
+func openWriteAheadLog(path string, apply func([]walMutation)) (*writeAheadLog, error) {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL: %w", err)
@@ -40,7 +48,7 @@ func openWriteAheadLog(path string, apply func(string, mutation)) (*writeAheadLo
 	return w, nil
 }
 
-func (w *writeAheadLog) initializeAndReplay(apply func(string, mutation)) error {
+func (w *writeAheadLog) initializeAndReplay(apply func([]walMutation)) error {
 	info, err := w.file.Stat()
 	if err != nil {
 		return fmt.Errorf("stat WAL: %w", err)
@@ -86,7 +94,7 @@ func (w *writeAheadLog) initializeAndReplay(apply func(string, mutation)) error 
 
 		payloadLength := binary.LittleEndian.Uint32(header[:4])
 		expectedChecksum := binary.LittleEndian.Uint32(header[4:])
-		if payloadLength < 9 || payloadLength > uint32(9+maxKeySize+maxValueSize) {
+		if payloadLength == 0 || payloadLength > uint32(maxWALBatchSize) {
 			return fmt.Errorf("lsm: invalid WAL record length %d", payloadLength)
 		}
 		payload := make([]byte, payloadLength)
@@ -104,11 +112,11 @@ func (w *writeAheadLog) initializeAndReplay(apply func(string, mutation)) error 
 			return fmt.Errorf("lsm: WAL checksum mismatch at offset %d", recordStart)
 		}
 
-		key, value, tombstone, err := decodeWALPayload(payload)
+		mutations, err := decodeWALPayload(payload)
 		if err != nil {
 			return fmt.Errorf("decode WAL record at offset %d: %w", recordStart, err)
 		}
-		apply(string(key), mutation{value: value, tombstone: tombstone})
+		apply(mutations)
 		offset += walRecordHeaderSize + int64(payloadLength)
 	}
 
@@ -118,27 +126,76 @@ func (w *writeAheadLog) initializeAndReplay(apply func(string, mutation)) error 
 	return nil
 }
 
-func decodeWALPayload(payload []byte) ([]byte, []byte, bool, error) {
+func decodeWALPayload(payload []byte) ([]walMutation, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("empty payload")
+	}
+	if payload[0] == walBatch {
+		return decodeWALBatch(payload)
+	}
+	current, consumed, err := decodeWALMutation(payload)
+	if err != nil {
+		return nil, err
+	}
+	if consumed != len(payload) {
+		return nil, fmt.Errorf("record length does not match payload")
+	}
+	return []walMutation{current}, nil
+}
+
+func decodeWALBatch(payload []byte) ([]walMutation, error) {
+	if len(payload) < 5 {
+		return nil, fmt.Errorf("batch header is truncated")
+	}
+	count := binary.LittleEndian.Uint32(payload[1:5])
+	if count == 0 {
+		return nil, fmt.Errorf("batch is empty")
+	}
+	result := make([]walMutation, 0, count)
+	offset := 5
+	for index := uint32(0); index < count; index++ {
+		if offset >= len(payload) {
+			return nil, fmt.Errorf("batch mutation %d is truncated", index+1)
+		}
+		current, consumed, err := decodeWALMutation(payload[offset:])
+		if err != nil {
+			return nil, fmt.Errorf("batch mutation %d: %w", index+1, err)
+		}
+		result = append(result, current)
+		offset += consumed
+	}
+	if offset != len(payload) {
+		return nil, fmt.Errorf("batch length does not match payload")
+	}
+	return result, nil
+}
+
+func decodeWALMutation(payload []byte) (walMutation, int, error) {
+	if len(payload) < 9 {
+		return walMutation{}, 0, fmt.Errorf("mutation header is truncated")
+	}
 	operation := payload[0]
 	keyLength := binary.LittleEndian.Uint32(payload[1:5])
 	valueLength := binary.LittleEndian.Uint32(payload[5:9])
 	if keyLength == 0 || keyLength > maxKeySize || valueLength > maxValueSize {
-		return nil, nil, false, fmt.Errorf("invalid key/value lengths")
+		return walMutation{}, 0, fmt.Errorf("invalid key/value lengths")
 	}
-	if uint64(9)+uint64(keyLength)+uint64(valueLength) != uint64(len(payload)) {
-		return nil, nil, false, fmt.Errorf("record length does not match payload")
+	length := uint64(9) + uint64(keyLength) + uint64(valueLength)
+	if length > uint64(len(payload)) {
+		return walMutation{}, 0, fmt.Errorf("mutation is truncated")
 	}
 	if operation != walPut && operation != walDelete {
-		return nil, nil, false, fmt.Errorf("unknown operation %d", operation)
+		return walMutation{}, 0, fmt.Errorf("unknown operation %d", operation)
 	}
 	if operation == walDelete && valueLength != 0 {
-		return nil, nil, false, fmt.Errorf("delete record contains a value")
+		return walMutation{}, 0, fmt.Errorf("delete record contains a value")
 	}
 
 	keyEnd := 9 + int(keyLength)
 	key := cloneBytes(payload[9:keyEnd])
-	value := cloneBytes(payload[keyEnd:])
-	return key, value, operation == walDelete, nil
+	valueEnd := keyEnd + int(valueLength)
+	value := cloneBytes(payload[keyEnd:valueEnd])
+	return walMutation{key: key, entry: mutation{value: value, tombstone: operation == walDelete}}, int(length), nil
 }
 
 func (w *writeAheadLog) append(key, value []byte, tombstone bool) error {
@@ -149,16 +206,46 @@ func (w *writeAheadLog) append(key, value []byte, tombstone bool) error {
 	}
 
 	payload := bytes.NewBuffer(make([]byte, 0, 9+len(key)+len(value)))
+	encodeWALMutation(payload, operation, key, value)
+	return w.appendPayload(payload.Bytes())
+}
+
+func (w *writeAheadLog) appendBatch(mutations []walMutation) error {
+	length := uint64(5)
+	for _, current := range mutations {
+		length += uint64(9 + len(current.key) + len(current.entry.value))
+	}
+	if length > maxWALBatchSize || length > math.MaxUint32 {
+		return fmt.Errorf("lsm: WAL batch is too large")
+	}
+	payload := bytes.NewBuffer(make([]byte, 0, int(length)))
+	payload.WriteByte(walBatch)
+	_ = binary.Write(payload, binary.LittleEndian, uint32(len(mutations)))
+	for _, current := range mutations {
+		operation := walPut
+		value := current.entry.value
+		if current.entry.tombstone {
+			operation = walDelete
+			value = nil
+		}
+		encodeWALMutation(payload, operation, current.key, value)
+	}
+	return w.appendPayload(payload.Bytes())
+}
+
+func encodeWALMutation(payload *bytes.Buffer, operation byte, key, value []byte) {
 	payload.WriteByte(operation)
 	_ = binary.Write(payload, binary.LittleEndian, uint32(len(key)))
 	_ = binary.Write(payload, binary.LittleEndian, uint32(len(value)))
 	_, _ = payload.Write(key)
 	_, _ = payload.Write(value)
+}
 
-	record := make([]byte, walRecordHeaderSize+payload.Len())
-	binary.LittleEndian.PutUint32(record[:4], uint32(payload.Len()))
-	binary.LittleEndian.PutUint32(record[4:8], crc32.ChecksumIEEE(payload.Bytes()))
-	copy(record[walRecordHeaderSize:], payload.Bytes())
+func (w *writeAheadLog) appendPayload(payload []byte) error {
+	record := make([]byte, walRecordHeaderSize+len(payload))
+	binary.LittleEndian.PutUint32(record[:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(record[4:8], crc32.ChecksumIEEE(payload))
+	copy(record[walRecordHeaderSize:], payload)
 
 	start, err := w.file.Seek(0, io.SeekCurrent)
 	if err != nil {

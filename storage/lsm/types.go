@@ -4,7 +4,11 @@
 // rows; catalog and row encoders will translate those objects into ordered keys.
 package lsm
 
-import "errors"
+import (
+	"errors"
+
+	"pebbledb/storage/kv"
+)
 
 const (
 	defaultMemtableSize = 4 << 20 // 4 MiB
@@ -37,12 +41,10 @@ func (o Options) normalized() (Options, error) {
 	return o, nil
 }
 
-// Entry is a live key/value pair returned by Scan. Keys and values are owned by
-// the caller and may be safely modified.
-type Entry struct {
-	Key   []byte
-	Value []byte
-}
+// Entry is kept as an alias for compatibility with callers of the storage
+// package. The shared definition lets transactional views implement the same
+// ordered KV contract.
+type Entry = kv.Entry
 
 // Stats is a point-in-time view of the local storage state.
 type Stats struct {

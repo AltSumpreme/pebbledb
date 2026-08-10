@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"pebbledb/storage/kv"
 )
 
 func TestPutGetDeleteAndCopies(t *testing.T) {
@@ -71,6 +73,62 @@ func TestWALRecoveryWithoutCleanClose(t *testing.T) {
 	t.Cleanup(func() { _ = recovered.Close() })
 	assertValue(t, recovered, "catalog/table/users", "schema", true)
 	assertValue(t, recovered, "catalog/table/old", "", false)
+}
+
+func TestAtomicBatchRecovery(t *testing.T) {
+	directory := t.TempDir()
+	store, err := Open(directory)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.Apply([]kv.Mutation{
+		{Key: []byte("row/1"), Value: []byte("one")},
+		{Key: []byte("row/2"), Value: []byte("two")},
+		{Key: []byte("row/old"), Delete: true},
+	}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	simulateCrash(t, store)
+
+	recovered, err := Open(directory)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	t.Cleanup(func() { _ = recovered.Close() })
+	assertValue(t, recovered, "row/1", "one", true)
+	assertValue(t, recovered, "row/2", "two", true)
+	assertValue(t, recovered, "row/old", "", false)
+}
+
+func TestIncompleteAtomicBatchReplaysNothing(t *testing.T) {
+	directory := t.TempDir()
+	store, err := Open(directory)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := store.Apply([]kv.Mutation{
+		{Key: []byte("row/1"), Value: []byte("one")},
+		{Key: []byte("row/2"), Value: []byte("two")},
+	}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	simulateCrash(t, store)
+
+	walPath := filepath.Join(directory, walFilename)
+	info, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL: %v", err)
+	}
+	if err := os.Truncate(walPath, info.Size()-3); err != nil {
+		t.Fatalf("truncate batch: %v", err)
+	}
+	recovered, err := Open(directory)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	t.Cleanup(func() { _ = recovered.Close() })
+	assertValue(t, recovered, "row/1", "", false)
+	assertValue(t, recovered, "row/2", "", false)
 }
 
 func TestWALIgnoresIncompleteTrailingRecord(t *testing.T) {

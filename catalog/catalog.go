@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"pebbledb/codec"
-	"pebbledb/storage/lsm"
+	"pebbledb/storage/kv"
 	"sort"
 	"sync"
 )
@@ -24,10 +24,10 @@ var catalogKeyPrefix = []byte{0x00, 'p', 'd', 'b', '-', 'c', 'a', 't', 0x01}
 // cannot be partially updated.
 type Catalog struct {
 	mu    sync.RWMutex
-	store *lsm.Store
+	store kv.Store
 }
 
-func New(store *lsm.Store) (*Catalog, error) {
+func New(store kv.Store) (*Catalog, error) {
 	if store == nil {
 		return nil, fmt.Errorf("catalog: store cannot be nil")
 	}
@@ -550,7 +550,7 @@ func (catalog *Catalog) putLocked(kind descriptorKind, id DescriptorID, descript
 	return catalog.store.Put(descriptorKey(kind, id), encoded)
 }
 
-func (catalog *Catalog) scanKindLocked(kind descriptorKind) ([]lsm.Entry, error) {
+func (catalog *Catalog) scanKindLocked(kind descriptorKind) ([]kv.Entry, error) {
 	prefix := descriptorPrefix(kind)
 	return catalog.store.Scan(prefix, codec.PrefixEnd(prefix))
 }

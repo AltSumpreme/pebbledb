@@ -112,8 +112,60 @@ func TestExplainAndExecutionErrors(t *testing.T) {
 	if err != nil || results[0].Rows[0][0].String() != "0" {
 		t.Fatalf("failed duplicate batch inserted rows: results=%+v err=%v", results, err)
 	}
-	if _, err := database.Execute("BEGIN"); err == nil {
-		t.Fatal("expected unsupported transaction error")
+	results, err = database.Execute("BEGIN; INSERT INTO users VALUES (2, 'B'); ROLLBACK; SELECT COUNT(*) FROM users")
+	if err != nil {
+		t.Fatalf("rollback transaction: %v", err)
+	}
+	if results[0].Message != "BEGIN" || results[2].Message != "ROLLBACK" || results[3].Rows[0][0].String() != "0" {
+		t.Fatalf("unexpected rollback results: %+v", results)
+	}
+}
+
+func TestExplicitTransactionsCommitRollbackAndAbort(t *testing.T) {
+	directory := t.TempDir()
+	database, err := engine.Open(directory)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := database.Execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance INT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	results, err := database.Execute("BEGIN; INSERT INTO accounts VALUES (1, 100); SELECT balance FROM accounts WHERE id = 1; COMMIT")
+	if err != nil {
+		t.Fatalf("commit transaction: %v", err)
+	}
+	if len(results) != 4 || results[2].Rows[0][0].String() != "100" || results[3].Message != "COMMIT" {
+		t.Fatalf("unexpected commit results: %+v", results)
+	}
+	if _, err := database.Execute("BEGIN; UPDATE accounts SET balance = 50 WHERE id = 1; ROLLBACK"); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	results, err = database.Execute("SELECT balance FROM accounts WHERE id = 1")
+	if err != nil || results[0].Rows[0][0].String() != "100" {
+		t.Fatalf("rollback leaked update: %+v, %v", results, err)
+	}
+
+	if _, err := database.Execute("BEGIN; INSERT INTO accounts VALUES (1, 200)"); err == nil {
+		t.Fatal("expected duplicate key to abort transaction")
+	}
+	if _, err := database.Execute("SELECT * FROM accounts"); err == nil || !strings.Contains(err.Error(), "aborted") {
+		t.Fatalf("expected aborted transaction error, got %v", err)
+	}
+	if results, err := database.Execute("ROLLBACK"); err != nil || results[0].Message != "ROLLBACK" {
+		t.Fatalf("rollback aborted transaction: %+v, %v", results, err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err = engine.Open(directory)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer database.Close()
+	results, err = database.Execute("SELECT balance FROM accounts WHERE id = 1")
+	if err != nil || len(results[0].Rows) != 1 || results[0].Rows[0][0].String() != "100" {
+		t.Fatalf("committed transaction did not survive restart: %+v, %v", results, err)
 	}
 }
 

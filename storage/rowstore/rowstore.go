@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"pebbledb/catalog"
 	"pebbledb/codec"
-	"pebbledb/storage/lsm"
+	"pebbledb/storage/kv"
 	"pebbledb/types"
 	"sync"
 )
@@ -27,10 +27,10 @@ type StoredRow struct {
 
 type Store struct {
 	mu    sync.Mutex
-	store *lsm.Store
+	store kv.Store
 }
 
-func New(store *lsm.Store) (*Store, error) {
+func New(store kv.Store) (*Store, error) {
 	if store == nil {
 		return nil, fmt.Errorf("rowstore: LSM store cannot be nil")
 	}
