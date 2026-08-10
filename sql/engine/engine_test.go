@@ -1,12 +1,50 @@
 package engine_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"pebbledb/distributed/raft"
 	"pebbledb/sql/engine"
 )
+
+func TestOnlineCheckpointRestoresCommittedSQLState(t *testing.T) {
+	root := t.TempDir()
+	database, err := engine.Open(filepath.Join(root, "source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Execute("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL); INSERT INTO items VALUES (1, 'before')"); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(root, "backup")
+	if err := database.Checkpoint(backup); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if _, err := database.Execute("UPDATE items SET name = 'after' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := engine.Open(backup)
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	defer restored.Close()
+	results, err := restored.Execute("SELECT name FROM items WHERE id = 1")
+	if err != nil || results[0].Rows[0][0].String() != "before" {
+		t.Fatalf("restored rows=%+v err=%v", results, err)
+	}
+	if _, err := restored.Execute("BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Checkpoint(filepath.Join(root, "invalid")); err == nil {
+		t.Fatal("checkpoint during explicit transaction unexpectedly succeeded")
+	}
+	_, _ = restored.Execute("ROLLBACK")
+}
 
 func TestEndToEndSQLAndRestart(t *testing.T) {
 	directory := t.TempDir()

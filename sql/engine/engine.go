@@ -38,6 +38,12 @@ type Engine struct {
 	closed     bool
 }
 
+type Diagnostics struct {
+	Storage   lsm.Stats
+	Consensus raft.Status
+	Ranges    []ranges.Descriptor
+}
+
 func Open(directory string) (*Engine, error) {
 	store, err := lsm.Open(directory)
 	if err != nil {
@@ -366,6 +372,44 @@ func (engine *Engine) Ranges() *ranges.Router { return engine.ranges }
 
 // ConsensusStatus reports the local member of the default range's Raft group.
 func (engine *Engine) ConsensusStatus() raft.Status { return engine.raftNode.Status() }
+
+// Diagnostics returns a consistent-enough operational snapshot without
+// exposing WAL or table file internals.
+func (engine *Engine) Diagnostics() Diagnostics {
+	return Diagnostics{
+		Storage: engine.store.Stats(), Consensus: engine.raftNode.Status(),
+		Ranges: engine.ranges.Descriptors(),
+	}
+}
+
+// Health verifies cancellation and a linearizable consensus read barrier.
+func (engine *Engine) Health(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	engine.mu.Lock()
+	closed := engine.closed
+	engine.mu.Unlock()
+	if closed {
+		return fmt.Errorf("sql engine: database is closed")
+	}
+	return engine.raftGroup.LinearizableRead()
+}
+
+// Checkpoint creates an online, self-contained backup. Explicit transactions
+// must finish first so the checkpoint corresponds to a session-independent
+// committed state.
+func (engine *Engine) Checkpoint(destination string) error {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.closed {
+		return fmt.Errorf("sql engine: database is closed")
+	}
+	if engine.active != nil {
+		return fmt.Errorf("sql engine: cannot checkpoint during an explicit transaction")
+	}
+	return engine.store.Checkpoint(destination)
+}
 
 func (engine *Engine) Close() error {
 	engine.mu.Lock()

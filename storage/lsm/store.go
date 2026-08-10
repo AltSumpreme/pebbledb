@@ -3,9 +3,11 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"pebbledb/storage/kv"
@@ -321,6 +323,106 @@ func (store *Store) Compact() error {
 		cleanupErrors = append(cleanupErrors, fmt.Errorf("sync compacted directory: %w", err))
 	}
 	return errors.Join(cleanupErrors...)
+}
+
+// Checkpoint creates a self-contained, point-in-time copy of the store at
+// destination. It never overwrites an existing path. Files are copied into a
+// sibling temporary directory and atomically renamed after every file and
+// directory entry is durable.
+func (store *Store) Checkpoint(destination string) error {
+	if destination == "" {
+		return fmt.Errorf("lsm: checkpoint destination cannot be empty")
+	}
+	absolute, err := filepath.Abs(destination)
+	if err != nil {
+		return fmt.Errorf("lsm: resolve checkpoint destination: %w", err)
+	}
+	sourceAbsolute, err := filepath.Abs(store.directory)
+	if err != nil {
+		return fmt.Errorf("lsm: resolve checkpoint source: %w", err)
+	}
+	relative, err := filepath.Rel(sourceAbsolute, absolute)
+	if err != nil {
+		return fmt.Errorf("lsm: compare checkpoint paths: %w", err)
+	}
+	if relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator))) {
+		return fmt.Errorf("lsm: checkpoint destination cannot be inside source")
+	}
+	if _, err := os.Lstat(absolute); err == nil {
+		return fmt.Errorf("lsm: checkpoint destination already exists")
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("lsm: inspect checkpoint destination: %w", err)
+	}
+	parent := filepath.Dir(absolute)
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return fmt.Errorf("lsm: create checkpoint parent: %w", err)
+	}
+	temporary, err := os.MkdirTemp(parent, ".pebbledb-checkpoint-*")
+	if err != nil {
+		return fmt.Errorf("lsm: create checkpoint staging directory: %w", err)
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			_ = os.RemoveAll(temporary)
+		}
+	}()
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrClosed
+	}
+	if err := store.flushLocked(); err != nil {
+		return fmt.Errorf("lsm: flush checkpoint: %w", err)
+	}
+	entries, err := os.ReadDir(store.directory)
+	if err != nil {
+		return fmt.Errorf("lsm: list checkpoint source: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		if err := copyDurableFile(filepath.Join(store.directory, entry.Name()), filepath.Join(temporary, entry.Name())); err != nil {
+			return err
+		}
+	}
+	if err := syncDirectory(temporary); err != nil {
+		return fmt.Errorf("lsm: sync checkpoint staging directory: %w", err)
+	}
+	if err := os.Rename(temporary, absolute); err != nil {
+		return fmt.Errorf("lsm: install checkpoint: %w", err)
+	}
+	installed = true
+	if err := syncDirectory(parent); err != nil {
+		return fmt.Errorf("lsm: sync checkpoint parent: %w", err)
+	}
+	return nil
+}
+
+func copyDurableFile(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("lsm: open checkpoint source %s: %w", filepath.Base(source), err)
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("lsm: create checkpoint file %s: %w", filepath.Base(destination), err)
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		_ = output.Close()
+		return fmt.Errorf("lsm: copy checkpoint file %s: %w", filepath.Base(source), err)
+	}
+	if err := output.Sync(); err != nil {
+		_ = output.Close()
+		return fmt.Errorf("lsm: sync checkpoint file %s: %w", filepath.Base(source), err)
+	}
+	if err := output.Close(); err != nil {
+		return fmt.Errorf("lsm: close checkpoint file %s: %w", filepath.Base(source), err)
+	}
+	return nil
 }
 
 // Stats returns local counts useful for diagnostics and tests.

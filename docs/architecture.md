@@ -159,20 +159,32 @@ tests for any persistent format it introduces.
     - TLS, SCRAM, PostgreSQL system catalogs, and simultaneous explicit
       transactions from multiple sessions remain compatibility gaps. Until TLS
       is added, cleartext-password mode is suitable only on a trusted network.
-13. **Hardening**
-    - Deterministic simulation, crash/partition/disk-fault testing, backup and
-      restore, observability, security, compatibility suites, and benchmarking.
+13. **Chaos, recovery, and observability (implemented)**
+    - Seeded multi-epoch Raft simulations inject availability loss and network
+      partitions, force elections/log repair, and continuously verify every
+      acknowledged write against all replicas. Deterministic KV failures prove
+      failed MVCC batches stay invisible and can be retried atomically.
+    - Online LSM checkpoints flush to immutable files, copy and sync through a
+      staging directory, atomically install without overwriting, and reopen as
+      independent SQL databases. The server exposes consensus-aware `/healthz`,
+      JSON `/status`, and Prometheus-style `/metrics` endpoints.
+14. **Performance engineering**
+    - Block cache, Bloom filters, sparse table indexes, background maintenance,
+      workload benchmarks, profiles, and regression thresholds.
+15. **Production hardening**
+    - Directory locking, configuration validation, TLS/SCRAM, safe upgrades,
+      distributed commit recovery, operational tooling, and release checks.
 
 PostgreSQL wire support is intentionally late in the dependency chain but can be
 developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 13 introduces deterministic chaos/recovery testing, backup/restore,
-and observability. The PostgreSQL endpoint can be started with:
+Milestone 14 introduces measured storage/query performance engineering. The
+PostgreSQL and admin endpoints can be started with:
 
 ```text
-go run ./cmd/pebbledb-server -data ./data -listen 127.0.0.1:5432
+go run ./cmd/pebbledb-server -data ./data -listen 127.0.0.1:5432 -admin 127.0.0.1:8080
 psql -h 127.0.0.1 -p 5432 -U pebbledb
 ```
 

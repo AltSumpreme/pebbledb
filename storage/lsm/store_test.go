@@ -313,6 +313,38 @@ func TestAutomaticFlushAndCompaction(t *testing.T) {
 	assertValue(t, store, "b", "", false)
 }
 
+func TestOnlineCheckpointIsIndependentAndNeverOverwrites(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, "source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Apply([]kv.Mutation{{Key: []byte("a"), Value: []byte("one")}, {Key: []byte("b"), Value: []byte("two")}}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := filepath.Join(root, "backup")
+	if err := store.Checkpoint(checkpoint); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := store.Put([]byte("a"), []byte("changed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(checkpoint)
+	if err != nil {
+		t.Fatalf("open checkpoint: %v", err)
+	}
+	defer restored.Close()
+	assertValue(t, restored, "a", "one", true)
+	assertValue(t, restored, "b", "two", true)
+	if err := store.Checkpoint(checkpoint); err == nil {
+		t.Fatal("checkpoint unexpectedly overwrote existing backup")
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	store := openTestStore(t, Options{})
 	var wait sync.WaitGroup

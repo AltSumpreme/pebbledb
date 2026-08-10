@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"pebbledb/storage/fault"
 	"pebbledb/storage/lsm"
 )
 
@@ -126,6 +127,37 @@ func TestRestartRecoversVersionsAndTimestampOracle(t *testing.T) {
 		t.Fatalf("recovered timestamp %d did not advance past %d", after.ReadTimestamp(), before)
 	}
 	assertTransactionValue(t, after, "key", "before", true)
+}
+
+func TestFailedCommitIsInvisibleAndRetryable(t *testing.T) {
+	inner, err := lsm.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	injected, _ := fault.New(inner)
+	manager, err := NewManager(injected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := manager.Begin()
+	_ = transaction.Put([]byte("a"), []byte("one"))
+	_ = transaction.Put([]byte("b"), []byte("two"))
+	injected.FailAfter(fault.Apply, 0, nil)
+	if _, err := transaction.Commit(); !errors.Is(err, fault.ErrInjected) {
+		t.Fatalf("failed commit error=%v", err)
+	}
+	observer := manager.Begin()
+	assertTransactionValue(t, observer, "a", "", false)
+	assertTransactionValue(t, observer, "b", "", false)
+	observer.Rollback()
+	if _, err := transaction.Commit(); err != nil {
+		t.Fatalf("retry commit: %v", err)
+	}
+	observer = manager.Begin()
+	defer observer.Rollback()
+	assertTransactionValue(t, observer, "a", "one", true)
+	assertTransactionValue(t, observer, "b", "two", true)
 }
 
 func openManager(t *testing.T) (*Manager, func()) {
