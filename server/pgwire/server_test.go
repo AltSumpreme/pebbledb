@@ -1,0 +1,282 @@
+package pgwire
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"pebbledb/sql/engine"
+)
+
+func TestSimpleAndExtendedQueryProtocols(t *testing.T) {
+	database, server, address := startTestServer(t, Config{AuthMode: TrustAuth})
+	defer database.Close()
+	connection, reader, writer, startup := connect(t, address, "alice", "")
+	defer connection.Close()
+	if startup.backendPID == 0 || startup.secret == 0 {
+		t.Fatalf("missing backend key: %+v", startup)
+	}
+
+	messages := simple(t, reader, writer, `
+        CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+        INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+        SELECT id, name FROM users ORDER BY id;
+    `)
+	if countType(messages, 'C') != 3 || countType(messages, 'D') != 2 || messages[len(messages)-1].kind != 'Z' {
+		t.Fatalf("simple query messages=%v", messageKinds(messages))
+	}
+	rows := messagesOfType(messages, 'D')
+	if values := decodeTextRow(t, rows[1].payload); values[0] != "2" || values[1] != "Bob" {
+		t.Fatalf("second row=%v", values)
+	}
+
+	parsePayload := append(cstring("find_user"), cstring("SELECT name FROM users WHERE id = $1")...)
+	var parseTypes bytes.Buffer
+	parseTypes.Write(parsePayload)
+	_ = binary.Write(&parseTypes, binary.BigEndian, int16(1))
+	_ = binary.Write(&parseTypes, binary.BigEndian, int8OID)
+	sendFrontend(t, writer, 'P', parseTypes.Bytes())
+	if message := receive(t, reader); message.kind != '1' {
+		t.Fatalf("Parse response=%q", message.kind)
+	}
+
+	var bind bytes.Buffer
+	bind.Write(cstring("portal1"))
+	bind.Write(cstring("find_user"))
+	_ = binary.Write(&bind, binary.BigEndian, int16(0)) // text parameter formats
+	_ = binary.Write(&bind, binary.BigEndian, int16(1))
+	_ = binary.Write(&bind, binary.BigEndian, int32(1))
+	bind.WriteByte('2')
+	_ = binary.Write(&bind, binary.BigEndian, int16(1))
+	_ = binary.Write(&bind, binary.BigEndian, int16(1)) // binary results
+	sendFrontend(t, writer, 'B', bind.Bytes())
+	if message := receive(t, reader); message.kind != '2' {
+		t.Fatalf("Bind response=%q payload=%q", message.kind, message.payload)
+	}
+	sendFrontend(t, writer, 'D', append([]byte{'P'}, cstring("portal1")...))
+	if message := receive(t, reader); message.kind != 'T' {
+		t.Fatalf("Describe response=%q", message.kind)
+	}
+	var execute bytes.Buffer
+	execute.Write(cstring("portal1"))
+	_ = binary.Write(&execute, binary.BigEndian, int32(0))
+	sendFrontend(t, writer, 'E', execute.Bytes())
+	data := receive(t, reader)
+	if data.kind != 'D' {
+		t.Fatalf("Execute first response=%q", data.kind)
+	}
+	if values := decodeBinaryTextRow(t, data.payload); len(values) != 1 || string(values[0]) != "Bob" {
+		t.Fatalf("binary row=%q", values)
+	}
+	if complete := receive(t, reader); complete.kind != 'C' {
+		t.Fatalf("Execute completion=%q", complete.kind)
+	}
+	sendFrontend(t, writer, 'S', nil)
+	if ready := receive(t, reader); ready.kind != 'Z' || string(ready.payload) != "I" {
+		t.Fatalf("Sync response=%q %q", ready.kind, ready.payload)
+	}
+
+	// A real CancelRequest uses the BackendKeyData pair and has no response.
+	canceled := make(chan struct{})
+	var cancelOnce sync.Once
+	server.mu.Lock()
+	client := server.clients[startup.backendPID]
+	server.mu.Unlock()
+	client.setCancel(func() { cancelOnce.Do(func() { close(canceled) }) })
+	cancelConnection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cancelBody bytes.Buffer
+	_ = binary.Write(&cancelBody, binary.BigEndian, int32(cancelRequestCode))
+	_ = binary.Write(&cancelBody, binary.BigEndian, startup.backendPID)
+	_ = binary.Write(&cancelBody, binary.BigEndian, startup.secret)
+	var startupCancel bytes.Buffer
+	_ = binary.Write(&startupCancel, binary.BigEndian, int32(cancelBody.Len()+4))
+	startupCancel.Write(cancelBody.Bytes())
+	_, _ = cancelConnection.Write(startupCancel.Bytes())
+	_ = cancelConnection.Close()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("CancelRequest did not cancel the matching backend")
+	}
+}
+
+func TestCleartextAuthenticationAndTransactionStatus(t *testing.T) {
+	database, _, address := startTestServer(t, Config{AuthMode: CleartextPasswordAuth, User: "reuben", Password: "secret"})
+	defer database.Close()
+	connection, reader, writer, _ := connect(t, address, "reuben", "secret")
+	defer connection.Close()
+	messages := simple(t, reader, writer, "BEGIN")
+	if ready := messages[len(messages)-1]; ready.kind != 'Z' || string(ready.payload) != "T" {
+		t.Fatalf("BEGIN ready status=%q", ready.payload)
+	}
+	messages = simple(t, reader, writer, "ROLLBACK")
+	if ready := messages[len(messages)-1]; ready.kind != 'Z' || string(ready.payload) != "I" {
+		t.Fatalf("ROLLBACK ready status=%q", ready.payload)
+	}
+
+	bad, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badReader, badWriter := bufio.NewReader(bad), bufio.NewWriter(bad)
+	sendStartup(t, badWriter, "reuben")
+	if request := receive(t, badReader); request.kind != 'R' || binary.BigEndian.Uint32(request.payload) != 3 {
+		t.Fatalf("auth request=%q %v", request.kind, request.payload)
+	}
+	sendFrontend(t, badWriter, 'p', cstring("wrong"))
+	if response := receive(t, badReader); response.kind != 'E' {
+		t.Fatalf("bad password response=%q", response.kind)
+	}
+	_ = bad.Close()
+}
+
+type startupInfo struct{ backendPID, secret uint32 }
+type wireMessage struct {
+	kind    byte
+	payload []byte
+}
+
+func startTestServer(t *testing.T, config Config) (*engine.Engine, *Server, string) {
+	t.Helper()
+	database, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(database, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	})
+	return database, server, listener.Addr().String()
+}
+
+func connect(t *testing.T, address, user, password string) (net.Conn, *bufio.Reader, *bufio.Writer, startupInfo) {
+	t.Helper()
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, writer := bufio.NewReader(connection), bufio.NewWriter(connection)
+	sendStartup(t, writer, user)
+	info := startupInfo{}
+	for {
+		message := receive(t, reader)
+		if message.kind == 'R' && binary.BigEndian.Uint32(message.payload) == 3 {
+			sendFrontend(t, writer, 'p', cstring(password))
+		}
+		if message.kind == 'K' {
+			info.backendPID = binary.BigEndian.Uint32(message.payload[:4])
+			info.secret = binary.BigEndian.Uint32(message.payload[4:])
+		}
+		if message.kind == 'E' {
+			t.Fatalf("startup error: %q", message.payload)
+		}
+		if message.kind == 'Z' {
+			return connection, reader, writer, info
+		}
+	}
+}
+
+func sendStartup(t *testing.T, writer *bufio.Writer, user string) {
+	t.Helper()
+	var body bytes.Buffer
+	_ = binary.Write(&body, binary.BigEndian, int32(protocolVersion3))
+	body.Write(cstring("user"))
+	body.Write(cstring(user))
+	body.Write(cstring("database"))
+	body.Write(cstring("pebbledb"))
+	body.WriteByte(0)
+	_ = binary.Write(writer, binary.BigEndian, int32(body.Len()+4))
+	_, _ = writer.Write(body.Bytes())
+	_ = writer.Flush()
+}
+
+func simple(t *testing.T, reader *bufio.Reader, writer *bufio.Writer, sql string) []wireMessage {
+	t.Helper()
+	sendFrontend(t, writer, 'Q', cstring(sql))
+	var messages []wireMessage
+	for {
+		message := receive(t, reader)
+		messages = append(messages, message)
+		if message.kind == 'Z' {
+			return messages
+		}
+	}
+}
+
+func sendFrontend(t *testing.T, writer *bufio.Writer, kind byte, payload []byte) {
+	t.Helper()
+	if err := writeMessage(writer, kind, payload); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func receive(t *testing.T, reader *bufio.Reader) wireMessage {
+	t.Helper()
+	kind, payload, err := readMessage(reader, defaultMaxMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wireMessage{kind: kind, payload: payload}
+}
+
+func decodeTextRow(t *testing.T, payload []byte) []string {
+	t.Helper()
+	offset := 0
+	count, _ := int16Value(payload, &offset)
+	result := make([]string, count)
+	for index := range result {
+		length, _ := int32Value(payload, &offset)
+		result[index] = string(payload[offset : offset+int(length)])
+		offset += int(length)
+	}
+	return result
+}
+
+func decodeBinaryTextRow(t *testing.T, payload []byte) [][]byte {
+	t.Helper()
+	offset := 0
+	count, _ := int16Value(payload, &offset)
+	result := make([][]byte, count)
+	for index := range result {
+		length, _ := int32Value(payload, &offset)
+		result[index] = append([]byte(nil), payload[offset:offset+int(length)]...)
+		offset += int(length)
+	}
+	return result
+}
+
+func countType(messages []wireMessage, kind byte) int { return len(messagesOfType(messages, kind)) }
+func messagesOfType(messages []wireMessage, kind byte) []wireMessage {
+	var result []wireMessage
+	for _, message := range messages {
+		if message.kind == kind {
+			result = append(result, message)
+		}
+	}
+	return result
+}
+func messageKinds(messages []wireMessage) []byte {
+	result := make([]byte, len(messages))
+	for index := range messages {
+		result[index] = messages[index].kind
+	}
+	return result
+}

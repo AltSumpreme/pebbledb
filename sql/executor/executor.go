@@ -28,6 +28,29 @@ type Result struct {
 	Plan         string
 }
 
+// DescribeColumns returns the result shape of a physical plan without running
+// it. PostgreSQL's extended protocol uses this for Describe messages.
+func DescribeColumns(physical plan.PhysicalPlan) []ResultColumn {
+	if physical.Root == nil {
+		return nil
+	}
+	switch physical.Root.Kind {
+	case plan.ScanKind, plan.JoinKind, plan.FilterKind, plan.SortKind, plan.ProjectKind, plan.LimitKind, plan.AggregateKind:
+		return resultColumns(physical.Root)
+	case plan.ShowKind:
+		return []ResultColumn{{Name: "table_name", Type: types.TextType()}}
+	case plan.DescribeKind:
+		return []ResultColumn{
+			{Name: "column_name", Type: types.TextType()},
+			{Name: "data_type", Type: types.TextType()},
+			{Name: "nullable", Type: types.BoolType()},
+			{Name: "primary_key", Type: types.BoolType()},
+		}
+	default:
+		return nil
+	}
+}
+
 type Executor struct {
 	mu      sync.Mutex
 	catalog *catalog.Catalog

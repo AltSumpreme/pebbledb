@@ -148,9 +148,17 @@ tests for any persistent format it introduces.
       `Move` and `Merge` primitives copy before metadata publication and clean
       obsolete source copies afterward. An orchestrator boundary owns external
       node provisioning and Raft membership changes.
-12. **PostgreSQL compatibility**
-    - Startup/authentication, simple and extended query protocols, PostgreSQL
-      type/result encoding, sessions, prepared statements, and cancellation.
+12. **PostgreSQL compatibility (initial protocol implemented)**
+    - A runnable PostgreSQL v3 TCP server supports SSL refusal/negotiation,
+      trust or cleartext-password startup, parameter status, BackendKeyData,
+      simple queries, and extended Parse/Bind/Describe/Execute/Close/Sync flows.
+    - Connection-local prepared statements/portals, portal suspension, text and
+      binary BOOL/INT/BIGINT/TEXT/NUMERIC results, text/binary parameters,
+      transaction-ready states, SQLSTATE errors, and authenticated out-of-band
+      cancellation are raw-protocol integration tested.
+    - TLS, SCRAM, PostgreSQL system catalogs, and simultaneous explicit
+      transactions from multiple sessions remain compatibility gaps. Until TLS
+      is added, cleartext-password mode is suitable only on a trusted network.
 13. **Hardening**
     - Deterministic simulation, crash/partition/disk-fault testing, backup and
       restore, observability, security, compatibility suites, and benchmarking.
@@ -160,8 +168,15 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 12 introduces PostgreSQL wire compatibility and session state. The
-completed distributed read path is:
+Milestone 13 introduces deterministic chaos/recovery testing, backup/restore,
+and observability. The PostgreSQL endpoint can be started with:
+
+```text
+go run ./cmd/pebbledb-server -data ./data -listen 127.0.0.1:5432
+psql -h 127.0.0.1 -p 5432 -U pebbledb
+```
+
+The completed distributed read path is:
 
 ```text
 optimized SQL scan -> range span derivation -> admitted remote processors

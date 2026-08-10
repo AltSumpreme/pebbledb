@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -97,6 +98,12 @@ func Open(directory string) (*Engine, error) {
 // Execute parses and executes semicolon-separated SQL statements in order.
 // Statements use serializable autocommit unless enclosed by BEGIN and COMMIT.
 func (engine *Engine) Execute(sql string) ([]executor.Result, error) {
+	return engine.ExecuteContext(context.Background(), sql)
+}
+
+// ExecuteContext checks cancellation between planning, execution, and commit
+// boundaries. Operators are currently cooperative at statement boundaries.
+func (engine *Engine) ExecuteContext(ctx context.Context, sql string) ([]executor.Result, error) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.closed {
@@ -111,6 +118,12 @@ func (engine *Engine) Execute(sql string) ([]executor.Result, error) {
 	}
 	results := make([]executor.Result, 0, len(statements))
 	for index, statement := range statements {
+		if err := ctx.Err(); err != nil {
+			if engine.active != nil {
+				engine.failed = true
+			}
+			return results, err
+		}
 		if result, handled, err := engine.transactionControl(statement); handled {
 			if err != nil {
 				return results, fmt.Errorf("statement %d: %w", index+1, err)
@@ -127,6 +140,9 @@ func (engine *Engine) Execute(sql string) ([]executor.Result, error) {
 			transaction = engine.manager.Begin()
 		}
 		result, err := engine.executeStatement(transaction, statement)
+		if err == nil {
+			err = ctx.Err()
+		}
 		if err == nil && autocommit {
 			_, err = transaction.Commit()
 		}
@@ -141,6 +157,45 @@ func (engine *Engine) Execute(sql string) ([]executor.Result, error) {
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+// Describe returns the typed result columns of one statement without executing
+// it, for prepared-statement and wire-protocol metadata.
+func (engine *Engine) Describe(sql string) ([]executor.ResultColumn, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.closed {
+		return nil, fmt.Errorf("sql engine: database is closed")
+	}
+	statement, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	if engine.failed {
+		return nil, fmt.Errorf("current transaction is aborted; ROLLBACK is required")
+	}
+	transaction := engine.active
+	if transaction == nil {
+		transaction = engine.manager.Begin()
+		defer transaction.Rollback()
+	}
+	_, binderValue, _, indexes, err := engine.components(transaction)
+	if err != nil {
+		return nil, err
+	}
+	bound, err := binderValue.Bind(statement)
+	if err != nil {
+		return nil, err
+	}
+	logical, err := plan.Build(bound)
+	if err != nil {
+		return nil, err
+	}
+	physical, err := plan.Optimize(logical, indexes)
+	if err != nil {
+		return nil, err
+	}
+	return executor.DescribeColumns(physical), nil
 }
 
 func (engine *Engine) transactionControl(statement ast.Statement) (executor.Result, bool, error) {
