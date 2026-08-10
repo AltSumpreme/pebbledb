@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"pebbledb/catalog"
+	"pebbledb/distributed/ranges"
 	"pebbledb/sql/ast"
 	"pebbledb/sql/binder"
 	"pebbledb/sql/executor"
@@ -22,6 +23,7 @@ import (
 type Engine struct {
 	mu         sync.Mutex
 	store      *lsm.Store
+	ranges     *ranges.Router
 	manager    *mvcc.Manager
 	catalog    *catalog.Catalog
 	databaseID catalog.DescriptorID
@@ -40,7 +42,11 @@ func Open(directory string) (*Engine, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	manager, err := mvcc.NewManager(store)
+	rangeRouter, err := ranges.Open(store, ranges.Replica{ID: 1, Store: store})
+	if err != nil {
+		return fail(err)
+	}
+	manager, err := mvcc.NewManager(rangeRouter)
 	if err != nil {
 		return fail(err)
 	}
@@ -54,6 +60,7 @@ func Open(directory string) (*Engine, error) {
 	}
 	return &Engine{
 		store:      store,
+		ranges:     rangeRouter,
 		manager:    manager,
 		catalog:    catalogValue,
 		databaseID: database.ID,
@@ -232,6 +239,10 @@ func (engine *Engine) Explain(sql string) (string, error) {
 
 // Catalog exposes an autocommit administrative catalog view.
 func (engine *Engine) Catalog() *catalog.Catalog { return engine.catalog }
+
+// Ranges exposes a read-mostly routing view for diagnostics and administrative
+// split orchestration.
+func (engine *Engine) Ranges() *ranges.Router { return engine.ranges }
 
 func (engine *Engine) Close() error {
 	engine.mu.Lock()

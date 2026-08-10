@@ -114,9 +114,13 @@ tests for any persistent format it introduces.
      and range phantom conflicts. SQL statements are atomic by default, while
      `BEGIN`, `COMMIT`, and `ROLLBACK` provide multi-statement transactions with
      read-your-writes behavior and aborted-transaction handling.
-8. **Ranges and routing**
-   - Key-range descriptors, range-aware requests, splits, and a single-process
-     multi-range test harness.
+8. **Ranges and routing (implemented)**
+   - Checksummed persistent descriptors provide a gap-free byte-key range map,
+     generation-checked range requests, ordered multi-range scans, and explicit
+     rejection of cross-range atomic batches pending distributed coordination.
+   - Splits copy the future right-hand span before atomically publishing both
+     descriptors, then clean obsolete source copies. A multi-LSM harness covers
+     boundary routing, data movement, stale clients, restart, and corruption.
 9. **Raft replication**
    - One consensus group per range, replicated commands/snapshots, membership
      changes, and quorum recovery tests.
@@ -138,14 +142,15 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 8 introduces persistent key-range descriptors and a range router above
-MVCC. The completed local path is:
+Milestone 9 introduces replicated range state machines and quorum consensus. The
+completed local path is:
 
 ```text
 SQL statement -> serializable MVCC transaction
-              -> catalog + row + index versions in one WAL batch
+              -> persistent range router
+              -> one range-local atomic WAL batch
               -> ordered LSM storage
 ```
 
-Range boundaries will use the same bytewise logical key order, so routing does
-not leak into SQL semantics or the relational codecs.
+Cross-range SQL commits remain deliberately disabled until the distributed
+transaction coordinator arrives; no partial cross-range commit is allowed.
