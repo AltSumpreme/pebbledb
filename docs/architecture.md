@@ -80,9 +80,12 @@ tests for any persistent format it introduces.
    - Versioned order-preserving composite keys, deterministic rows keyed by
      stable column IDs, and versioned table schemas with compatibility,
      round-trip, ordering, LSM integration, and corruption tests.
-3. **Catalog**
-   - Persistent databases, schemas, tables, columns, indexes, and constraints.
-   - Transactional catalog operations, `SHOW TABLES`, and table description.
+3. **Catalog (implemented)**
+   - Checksummed, versioned database, schema, and atomic table descriptors over
+     the LSM; table records include columns, indexes, constraints, and partitions.
+   - Idempotent default bootstrap, normalized name resolution, sorted listings,
+     complete table description, dependency-safe drops, revision tracking,
+     concurrent DDL serialization, and restart/corruption coverage.
 4. **SQL frontend**
    - Standards-shaped lexer/parser and typed AST for DDL and DML.
    - Binder resolves names and types exclusively through a catalog interface.
@@ -120,8 +123,8 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 3 starts with a persistent catalog over the `types`, `codec`, and LSM
-contracts. The first end-to-end vertical path will be:
+Milestone 4 starts with a typed SQL AST and binder over the persistent catalog.
+The first end-to-end vertical path will be:
 
 ```text
 CREATE TABLE -> catalog records in LSM
