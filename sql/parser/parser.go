@@ -301,6 +301,27 @@ func (parser *Parser) parseSelect() (ast.Statement, error) {
 	if err != nil {
 		return nil, err
 	}
+	for {
+		if parser.matchKeyword("inner") {
+			if err := parser.expectKeyword("join"); err != nil {
+				return nil, err
+			}
+		} else if !parser.matchKeyword("join") {
+			break
+		}
+		table, err := parser.parseName()
+		if err != nil {
+			return nil, err
+		}
+		if err := parser.expectKeyword("on"); err != nil {
+			return nil, err
+		}
+		on, err := parser.parseExpression(1)
+		if err != nil {
+			return nil, err
+		}
+		statement.Joins = append(statement.Joins, ast.Join{Table: table, On: on})
+	}
 	if parser.matchKeyword("where") {
 		statement.Where, err = parser.parseExpression(1)
 		if err != nil {

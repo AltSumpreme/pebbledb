@@ -93,10 +93,13 @@ tests for any persistent format it introduces.
    - Catalog-backed binder resolves qualified tables and columns, expands stars,
      validates predicates/functions/assignments, and contextually coerces typed
      INSERT, UPDATE, comparison, and exact-decimal literals.
-5. **Planning and local execution**
-   - Logical and physical plans; scan, values, filter, project, limit, sort,
-     insert, update, delete, aggregate, and join operators.
-   - `EXPLAIN` exposes plans without leaking storage internals.
+5. **Planning and local execution (implemented)**
+   - LSM-backed relational row store plus explicit logical/physical plans and
+     primary-key-ordered scan, filter, project, limit, sort, global aggregate,
+     nested-loop inner join, insert, update, delete, and catalog/DDL operators.
+   - End-to-end SQL engine, typed expression evaluation with SQL NULL logic,
+     restart persistence, multi-row validation, and `EXPLAIN` output that exposes
+     operators/access paths without leaking WAL or SSTable internals.
 6. **Indexes**
    - Primary and secondary index maintenance, uniqueness checks, index scans,
      statistics, and initial cost-based access-path selection.
@@ -127,8 +130,8 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 5 starts with logical/physical plans and local execution over the bound
-SQL representation. The first end-to-end vertical path will be:
+Milestone 6 starts with maintained secondary indexes, uniqueness enforcement,
+statistics, and optimizer access-path selection. The completed local path is:
 
 ```text
 CREATE TABLE -> catalog records in LSM

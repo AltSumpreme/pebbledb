@@ -117,6 +117,35 @@ func TestBindQualifiedNamesIndexAndIfExists(t *testing.T) {
 	}
 }
 
+func TestBindJoinTracksTableColumnIdentity(t *testing.T) {
+	binderValue, catalogValue, _, schema := openTestBinder(t)
+	users, err := catalogValue.CreateTable(schema.ID, "users", []codec.ColumnDescriptor{
+		{ID: 1, Name: "id", Type: types.BigIntType()},
+		{ID: 2, Name: "name", Type: types.TextType()},
+	}, []uint32{1})
+	if err != nil {
+		t.Fatalf("users: %v", err)
+	}
+	orders, err := catalogValue.CreateTable(schema.ID, "orders", []codec.ColumnDescriptor{
+		{ID: 1, Name: "id", Type: types.BigIntType()},
+		{ID: 2, Name: "user_id", Type: types.BigIntType()},
+	}, []uint32{1})
+	if err != nil {
+		t.Fatalf("orders: %v", err)
+	}
+	selectStatement := bindSQL(t, binderValue, `SELECT users.name, orders.id
+        FROM users JOIN orders ON users.id = orders.user_id`).(binder.Select)
+	if len(selectStatement.Joins) != 1 || selectStatement.Joins[0].Table.ID != orders.ID {
+		t.Fatalf("unexpected join: %+v", selectStatement.Joins)
+	}
+	if selectStatement.Projection[0].Expression.TableID != users.ID || selectStatement.Projection[1].Expression.TableID != orders.ID {
+		t.Fatalf("bound columns lost table identity: %+v", selectStatement.Projection)
+	}
+	if _, err := bindSQLResult(binderValue, "SELECT id FROM users JOIN orders ON users.id = orders.user_id"); err == nil {
+		t.Fatal("expected unqualified ambiguous id to fail")
+	}
+}
+
 func openTestBinder(t *testing.T) (*binder.Binder, *catalog.Catalog, catalog.DatabaseDescriptor, catalog.SchemaDescriptor) {
 	t.Helper()
 	store, err := lsm.Open(t.TempDir())

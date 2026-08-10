@@ -204,21 +204,44 @@ func (binder *Binder) bindSelect(statement ast.Select) (Statement, error) {
 		return nil, err
 	}
 	result := Select{Table: table, Limit: statement.Limit}
+	scope := []catalog.TableDescriptor{table}
+	for _, rawJoin := range statement.Joins {
+		joinedTable, err := binder.resolveTable(rawJoin.Table)
+		if err != nil {
+			return nil, err
+		}
+		for _, existing := range scope {
+			if existing.ID == joinedTable.ID {
+				return nil, fmt.Errorf("sql binder: table %q occurs more than once without aliases", joinedTable.Name)
+			}
+		}
+		scope = append(scope, joinedTable)
+		on, err := binder.bindExpression(rawJoin.On, scope)
+		if err != nil {
+			return nil, err
+		}
+		if on.Type != types.BoolType() {
+			return nil, fmt.Errorf("sql binder: JOIN ON expression must be BOOL")
+		}
+		result.Joins = append(result.Joins, Join{Table: joinedTable, On: on})
+	}
 	for _, item := range statement.Items {
 		if _, star := item.Expression.(ast.Star); star {
-			for _, column := range table.Schema.Columns {
-				result.Projection = append(result.Projection, Projection{Expression: boundColumn(column), Alias: column.Name})
+			for _, scopedTable := range scope {
+				for _, column := range scopedTable.Schema.Columns {
+					result.Projection = append(result.Projection, Projection{Expression: boundColumn(scopedTable.ID, column), Alias: column.Name})
+				}
 			}
 			continue
 		}
-		expression, err := binder.bindExpression(item.Expression, table)
+		expression, err := binder.bindExpression(item.Expression, scope)
 		if err != nil {
 			return nil, err
 		}
 		result.Projection = append(result.Projection, Projection{Expression: expression, Alias: item.Alias})
 	}
 	if statement.Where != nil {
-		result.Filter, err = binder.bindExpression(statement.Where, table)
+		result.Filter, err = binder.bindExpression(statement.Where, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -227,7 +250,7 @@ func (binder *Binder) bindSelect(statement ast.Select) (Statement, error) {
 		}
 	}
 	for _, ordering := range statement.OrderBy {
-		expression, err := binder.bindExpression(ordering.Expression, table)
+		expression, err := binder.bindExpression(ordering.Expression, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +282,7 @@ func (binder *Binder) bindUpdate(statement ast.Update) (Statement, error) {
 			}
 			expression = boundLiteral(literal)
 		} else {
-			expression, err = binder.bindExpression(assignment.Value, table)
+			expression, err = binder.bindExpression(assignment.Value, []catalog.TableDescriptor{table})
 			if err != nil {
 				return nil, err
 			}
@@ -271,7 +294,7 @@ func (binder *Binder) bindUpdate(statement ast.Update) (Statement, error) {
 		seen[column.ID] = struct{}{}
 	}
 	if statement.Where != nil {
-		result.Filter, err = binder.bindExpression(statement.Where, table)
+		result.Filter, err = binder.bindExpression(statement.Where, []catalog.TableDescriptor{table})
 		if err != nil || result.Filter.Type != types.BoolType() {
 			if err == nil {
 				err = fmt.Errorf("sql binder: WHERE expression must be BOOL")
@@ -289,7 +312,7 @@ func (binder *Binder) bindDelete(statement ast.Delete) (Statement, error) {
 	}
 	result := Delete{Table: table}
 	if statement.Where != nil {
-		result.Filter, err = binder.bindExpression(statement.Where, table)
+		result.Filter, err = binder.bindExpression(statement.Where, []catalog.TableDescriptor{table})
 		if err != nil || result.Filter.Type != types.BoolType() {
 			if err == nil {
 				err = fmt.Errorf("sql binder: WHERE expression must be BOOL")
@@ -300,22 +323,18 @@ func (binder *Binder) bindDelete(statement ast.Delete) (Statement, error) {
 	return result, nil
 }
 
-func (binder *Binder) bindExpression(expression ast.Expression, table catalog.TableDescriptor) (*Expression, error) {
+func (binder *Binder) bindExpression(expression ast.Expression, scope []catalog.TableDescriptor) (*Expression, error) {
 	switch value := expression.(type) {
 	case ast.ColumnReference:
-		columnName := value.Name.Parts[len(value.Name.Parts)-1]
-		if len(value.Name.Parts) > 1 && value.Name.Parts[len(value.Name.Parts)-2] != table.Name {
-			return nil, fmt.Errorf("sql binder: column qualifier %q does not match table %q", value.Name.Parts[len(value.Name.Parts)-2], table.Name)
-		}
-		column, err := findColumn(table, columnName)
+		table, column, err := findColumnInScope(scope, value.Name)
 		if err != nil {
 			return nil, err
 		}
-		return boundColumn(column), nil
+		return boundColumn(table.ID, column), nil
 	case ast.Literal:
 		return bindUntypedLiteral(value)
 	case ast.UnaryExpression:
-		argument, err := binder.bindExpression(value.Value, table)
+		argument, err := binder.bindExpression(value.Value, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -328,11 +347,11 @@ func (binder *Binder) bindExpression(expression ast.Expression, table catalog.Ta
 		}
 		return &Expression{Kind: UnaryExpression, Type: argument.Type, Nullable: argument.Nullable, Operator: operator, Arguments: []*Expression{argument}}, nil
 	case ast.BinaryExpression:
-		left, err := binder.bindExpression(value.Left, table)
+		left, err := binder.bindExpression(value.Left, scope)
 		if err != nil {
 			return nil, err
 		}
-		right, err := binder.bindExpression(value.Right, table)
+		right, err := binder.bindExpression(value.Right, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -350,7 +369,7 @@ func (binder *Binder) bindExpression(expression ast.Expression, table catalog.Ta
 		}
 		return bindBinary(value.Operator, left, right)
 	case ast.FunctionCall:
-		return binder.bindFunction(value, table)
+		return binder.bindFunction(value, scope)
 	case ast.Star:
 		return nil, fmt.Errorf("sql binder: star is only valid as a projection or COUNT argument")
 	default:
@@ -358,7 +377,7 @@ func (binder *Binder) bindExpression(expression ast.Expression, table catalog.Ta
 	}
 }
 
-func (binder *Binder) bindFunction(call ast.FunctionCall, table catalog.TableDescriptor) (*Expression, error) {
+func (binder *Binder) bindFunction(call ast.FunctionCall, scope []catalog.TableDescriptor) (*Expression, error) {
 	name := strings.ToLower(call.Name)
 	if name == "count" && len(call.Arguments) == 1 {
 		if _, star := call.Arguments[0].(ast.Star); star {
@@ -367,7 +386,7 @@ func (binder *Binder) bindFunction(call ast.FunctionCall, table catalog.TableDes
 	}
 	arguments := make([]*Expression, 0, len(call.Arguments))
 	for _, raw := range call.Arguments {
-		argument, err := binder.bindExpression(raw, table)
+		argument, err := binder.bindExpression(raw, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +440,8 @@ func bindBinary(operator string, left, right *Expression) (*Expression, error) {
 func bindUntypedLiteral(literal ast.Literal) (*Expression, error) {
 	switch literal.Kind {
 	case ast.NullLiteral:
-		return &Expression{Kind: LiteralExpression, Nullable: true}, nil
+		null, _ := types.NullValue(types.TextType())
+		return &Expression{Kind: LiteralExpression, Type: types.TextType(), Nullable: true, Literal: null}, nil
 	case ast.BoolLiteral:
 		return &Expression{Kind: LiteralExpression, Type: types.BoolType(), Literal: types.BoolValue(strings.EqualFold(literal.Raw, "true"))}, nil
 	case ast.StringLiteral:
@@ -562,8 +582,37 @@ func resolveColumnNames(table catalog.TableDescriptor, names []string) ([]uint32
 	return result, nil
 }
 
-func boundColumn(column codec.ColumnDescriptor) *Expression {
-	return &Expression{Kind: ColumnExpression, Type: column.Type, Nullable: column.Nullable, ColumnID: column.ID, Name: column.Name}
+func findColumnInScope(scope []catalog.TableDescriptor, name ast.Name) (catalog.TableDescriptor, codec.ColumnDescriptor, error) {
+	columnName := name.Parts[len(name.Parts)-1]
+	qualifier := ""
+	if len(name.Parts) > 1 {
+		qualifier = name.Parts[len(name.Parts)-2]
+	}
+	var matchedTable catalog.TableDescriptor
+	var matchedColumn codec.ColumnDescriptor
+	matches := 0
+	for _, table := range scope {
+		if qualifier != "" && qualifier != table.Name {
+			continue
+		}
+		column, err := findColumn(table, columnName)
+		if err != nil {
+			continue
+		}
+		matchedTable, matchedColumn = table, column
+		matches++
+	}
+	if matches == 0 {
+		return catalog.TableDescriptor{}, codec.ColumnDescriptor{}, fmt.Errorf("sql binder: column %q does not exist in query scope", name.String())
+	}
+	if matches > 1 {
+		return catalog.TableDescriptor{}, codec.ColumnDescriptor{}, fmt.Errorf("sql binder: column %q is ambiguous", columnName)
+	}
+	return matchedTable, matchedColumn, nil
+}
+
+func boundColumn(tableID catalog.DescriptorID, column codec.ColumnDescriptor) *Expression {
+	return &Expression{Kind: ColumnExpression, Type: column.Type, Nullable: column.Nullable, TableID: tableID, ColumnID: column.ID, Name: column.Name}
 }
 
 func boundLiteral(value types.Value) *Expression {

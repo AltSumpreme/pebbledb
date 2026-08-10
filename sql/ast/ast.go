@@ -59,9 +59,14 @@ type OrderBy struct {
 	Expression Expression
 	Descending bool
 }
+type Join struct {
+	Table Name
+	On    Expression
+}
 type Select struct {
 	Items   []SelectItem
 	From    Name
+	Joins   []Join
 	Where   Expression
 	OrderBy []OrderBy
 	Limit   *int64

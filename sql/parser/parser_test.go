@@ -90,6 +90,19 @@ func TestParseCatalogAndTransactionStatements(t *testing.T) {
 	}
 }
 
+func TestParseInnerJoin(t *testing.T) {
+	statement, err := parser.Parse(`SELECT users.name, orders.total
+        FROM users INNER JOIN orders ON users.id = orders.user_id
+        WHERE orders.total > 10`)
+	if err != nil {
+		t.Fatalf("parse join: %v", err)
+	}
+	selectStatement := statement.(ast.Select)
+	if len(selectStatement.Joins) != 1 || selectStatement.Joins[0].Table.String() != "orders" || selectStatement.Joins[0].On == nil {
+		t.Fatalf("unexpected join AST: %+v", selectStatement)
+	}
+}
+
 func TestParserRejectsInvalidSQL(t *testing.T) {
 	for _, input := range []string{
 		"CREATE TABLE empty ()",

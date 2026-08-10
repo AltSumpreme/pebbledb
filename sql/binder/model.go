@@ -25,6 +25,7 @@ type Expression struct {
 	Nullable  bool
 	Literal   types.Value
 	ColumnID  uint32
+	TableID   catalog.DescriptorID
 	Name      string
 	Operator  string
 	Arguments []*Expression
@@ -67,10 +68,15 @@ type Ordering struct {
 }
 type Select struct {
 	Table      catalog.TableDescriptor
+	Joins      []Join
 	Projection []Projection
 	Filter     *Expression
 	Ordering   []Ordering
 	Limit      *int64
+}
+type Join struct {
+	Table catalog.TableDescriptor
+	On    *Expression
 }
 type Assignment struct {
 	ColumnID uint32
