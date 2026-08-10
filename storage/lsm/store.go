@@ -33,6 +33,7 @@ type Store struct {
 	stopMaintenance       chan struct{}
 	maintenanceDone       sync.WaitGroup
 	backgroundCompactions uint64
+	lockFile              *os.File
 }
 
 // Open opens or creates a Store in directory. At most one Options value may be
@@ -57,6 +58,19 @@ func Open(directory string, supplied ...Options) (*Store, error) {
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		return nil, fmt.Errorf("create LSM directory: %w", err)
 	}
+	lockFile, err := acquireDirectoryLock(directory)
+	if err != nil {
+		return nil, err
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			_ = releaseDirectoryLock(lockFile)
+		}
+	}()
+	if err := ensureFormatVersion(directory); err != nil {
+		return nil, err
+	}
 
 	tables, maxGeneration, err := loadSSTables(directory, options.BloomBitsPerKey)
 	if err != nil {
@@ -71,6 +85,7 @@ func Open(directory string, supplied ...Options) (*Store, error) {
 		cache:           newBlockCache(options.BlockCacheBytes),
 		maintenance:     make(chan struct{}, 1),
 		stopMaintenance: make(chan struct{}),
+		lockFile:        lockFile,
 	}
 	if store.nextGeneration == 0 {
 		closeSSTables(tables)
@@ -86,6 +101,7 @@ func Open(directory string, supplied ...Options) (*Store, error) {
 		store.maintenanceDone.Add(1)
 		go store.maintain()
 	}
+	releaseLock = false
 	return store, nil
 }
 
@@ -485,6 +501,10 @@ func (store *Store) Close() error {
 			closeErrors = append(closeErrors, fmt.Errorf("close SSTable: %w", err))
 		}
 	}
+	if err := releaseDirectoryLock(store.lockFile); err != nil {
+		closeErrors = append(closeErrors, fmt.Errorf("release directory lock: %w", err))
+	}
+	store.lockFile = nil
 	store.closed = true
 	store.closing = false
 	return errors.Join(closeErrors...)

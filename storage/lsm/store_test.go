@@ -444,6 +444,33 @@ func TestInputValidationAndClosedStore(t *testing.T) {
 	}
 }
 
+func TestDirectoryLockAndFormatVersion(t *testing.T) {
+	directory := t.TempDir()
+	store, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(directory); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second open error=%v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(directory)
+	if err != nil {
+		t.Fatalf("open after release: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "FORMAT"), []byte("future-format\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(directory); err == nil || !strings.Contains(err.Error(), "unsupported storage format") {
+		t.Fatalf("future format error=%v", err)
+	}
+}
+
 func TestRandomizedOperationsSurviveFlushCompactAndRestart(t *testing.T) {
 	directory := t.TempDir()
 	store, err := Open(directory, Options{MemtableSizeBytes: 256})
@@ -531,6 +558,11 @@ func simulateCrash(t *testing.T, store *Store) {
 		t.Fatalf("close WAL for simulated crash: %v", err)
 	}
 	closeSSTables(store.tables)
+	if err := releaseDirectoryLock(store.lockFile); err != nil {
+		store.mu.Unlock()
+		t.Fatalf("release lock for simulated crash: %v", err)
+	}
+	store.lockFile = nil
 	store.closed = true
 	store.closing = false
 	store.mu.Unlock()

@@ -72,8 +72,9 @@ tests for any persistent format it introduces.
 
 1. **LSM foundation**
    - 1A (implemented): WAL, memtable, SSTables, ordered scans, basic compaction.
-   - 1B: sparse indexes, Bloom filters, block cache, background flush, leveled
-     compaction, file manifest, directory locking, metrics, and fault injection.
+   - 1B (partially implemented): Bloom filters, block cache, background
+     compaction, directory locking, metrics, and fault injection. Sparse/block
+     indexes, a file manifest, and leveled compaction remain future work.
 2. **Typed relational model and codecs (implemented)**
    - SQL `NULL`, `BOOL`, `INT`, `BIGINT`, `TEXT`, bounded exact `DECIMAL`, and
      immutable typed values.
@@ -136,8 +137,8 @@ tests for any persistent format it introduces.
       admission limits, cancellation, missing-node handling, and retry-before-
       emit semantics. Streaming map/filter/project stages, equality hash joins,
       and typed global `COUNT`/`SUM` aggregation compose over those exchanges.
-    - Cross-range mutations remain fail-closed; a recoverable distributed commit
-      protocol is still required before enabling them.
+    - Cross-range mutations remain fail-closed while the durable commit
+      coordinator is integrated with range-local MVCC and Raft application.
 11. **Automatic placement (implemented)**
     - A continuously runnable controller consumes node capacity/liveness and
       range size/QPS heartbeats, maintains EWMA hot-range signals, and produces
@@ -156,9 +157,11 @@ tests for any persistent format it introduces.
       binary BOOL/INT/BIGINT/TEXT/NUMERIC results, text/binary parameters,
       transaction-ready states, SQLSTATE errors, and authenticated out-of-band
       cancellation are raw-protocol integration tested.
-    - TLS, SCRAM, PostgreSQL system catalogs, and simultaneous explicit
-      transactions from multiple sessions remain compatibility gaps. Until TLS
-      is added, cleartext-password mode is suitable only on a trusted network.
+    - PostgreSQL SSLRequest negotiation supports configured certificates and
+      TLS 1.2 or newer. Password authentication is rejected without TLS unless
+      an explicit development-only override is selected. SCRAM, PostgreSQL
+      system catalogs, and simultaneous explicit transactions from multiple
+      sessions remain compatibility gaps.
 13. **Chaos, recovery, and observability (implemented)**
     - Seeded multi-epoch Raft simulations inject availability loss and network
       partitions, force elections/log repair, and continuously verify every
@@ -177,17 +180,38 @@ tests for any persistent format it introduces.
       storage diagnostics and `/metrics`. Repeatable Go benchmarks cover durable
       writes, cached reads, ordered 1,000-row scans, and indexed SQL point reads;
       smoke benchmark execution is part of milestone verification.
-15. **Production hardening**
-    - Directory locking, configuration validation, TLS/SCRAM, safe upgrades,
-      distributed commit recovery, operational tooling, and release checks.
+15. **Production hardening (initial safety gates implemented)**
+    - An exclusive process lock prevents two LSM instances from opening one
+      directory. A durable `FORMAT` marker makes unknown on-disk versions fail
+      closed instead of attempting an unsafe open.
+    - PostgreSQL TLS configuration is cloned and constrained to TLS 1.2 or
+      newer by default; password mode requires TLS. The server CLI validates
+      certificate/key pairing and exposes the existing health/status/metrics
+      listener alongside graceful shutdown.
+    - A checksummed two-phase commit log durably records PREPARING, COMMIT, and
+      ABORT states. Idempotent range participants stage mutation intents, and
+      restart recovery rolls durable commits forward or incomplete prepares
+      back. Decision transitions never permit a committed transaction to abort.
+    - `make verify` builds all packages, runs unit/integration and race suites,
+      runs `go vet`, and smokes every storage/SQL benchmark. The existing CI
+      continues to enforce its build and unit-test checks.
+    - SCRAM, certificate rotation, rolling format migrations, automated restore,
+      and SQL/range/Raft integration of distributed commits remain production
+      hardening work; the repository must not yet be treated as production-ready.
 
 PostgreSQL wire support is intentionally late in the dependency chain but can be
 developed earlier as an adapter once stable session and result interfaces exist.
 
-## Next implementation slice
+## Verification and next integration slice
 
-Milestone 15 closes production-safety gaps and adds release checks. Benchmarks
-can be reproduced with:
+Milestones 1 through 15 now have tested implementation foundations. The full
+release-candidate gate is:
+
+```text
+make verify
+```
+
+Benchmarks can also be reproduced directly with:
 
 ```text
 go test -bench . -benchmem ./storage/lsm ./sql/engine
@@ -207,5 +231,6 @@ optimized SQL scan -> range span derivation -> admitted remote processors
                    -> bounded exchanges -> join/aggregate -> result stream
 ```
 
-Cross-range SQL commits remain deliberately disabled until the distributed
-transaction coordinator arrives; no partial cross-range commit is allowed.
+Cross-range SQL commits remain deliberately disabled until the new durable
+transaction coordinator is connected to range-local MVCC intents and replicated
+Raft application. No partial cross-range SQL commit is allowed in the meantime.

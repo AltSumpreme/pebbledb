@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +31,10 @@ type Config struct {
 	Password        string
 	ServerVersion   string
 	MaxMessageBytes int
+	TLSConfig       *tls.Config
+	// AllowInsecurePasswords permits cleartext-password authentication without
+	// TLS. It exists for isolated development tests and is unsafe on a network.
+	AllowInsecurePasswords bool
 }
 
 func (config Config) normalized() Config {
@@ -67,6 +72,21 @@ func New(database *engine.Engine, config Config) (*Server, error) {
 	config = config.normalized()
 	if config.AuthMode != TrustAuth && config.AuthMode != CleartextPasswordAuth {
 		return nil, fmt.Errorf("pgwire: unsupported authentication mode")
+	}
+	if config.AuthMode == CleartextPasswordAuth && (config.User == "" || config.Password == "") {
+		return nil, fmt.Errorf("pgwire: password authentication requires a non-empty user and password")
+	}
+	if config.AuthMode == CleartextPasswordAuth && config.TLSConfig == nil && !config.AllowInsecurePasswords {
+		return nil, fmt.Errorf("pgwire: cleartext-password authentication requires TLS")
+	}
+	if config.TLSConfig != nil {
+		config.TLSConfig = config.TLSConfig.Clone()
+		if len(config.TLSConfig.Certificates) == 0 && config.TLSConfig.GetCertificate == nil && config.TLSConfig.GetConfigForClient == nil {
+			return nil, fmt.Errorf("pgwire: TLS requires a server certificate or certificate callback")
+		}
+		if config.TLSConfig.MinVersion == 0 {
+			config.TLSConfig.MinVersion = tls.VersionTLS12
+		}
 	}
 	server := &Server{engine: database, config: config, clients: make(map[uint32]*client)}
 	server.nextPID.Store(1000)
@@ -125,6 +145,7 @@ func (server *Server) Shutdown(ctx context.Context) error {
 
 func (server *Server) serveConnection(connection net.Conn) {
 	reader, writer := bufio.NewReader(connection), bufio.NewWriter(connection)
+	tlsActive := false
 	for {
 		code, startup, err := readStartup(reader, server.config.MaxMessageBytes)
 		if err != nil {
@@ -133,13 +154,38 @@ func (server *Server) serveConnection(connection net.Conn) {
 		}
 		switch code {
 		case sslRequestCode:
-			_, _ = connection.Write([]byte{'N'})
+			if tlsActive {
+				_ = writeError(writer, "08P01", fmt.Errorf("TLS is already active"))
+				_ = connection.Close()
+				return
+			}
+			if server.config.TLSConfig == nil {
+				_, _ = connection.Write([]byte{'N'})
+				continue
+			}
+			if _, err := connection.Write([]byte{'S'}); err != nil {
+				_ = connection.Close()
+				return
+			}
+			secured := tls.Server(connection, server.config.TLSConfig)
+			if err := secured.Handshake(); err != nil {
+				_ = connection.Close()
+				return
+			}
+			connection = secured
+			reader, writer = bufio.NewReader(connection), bufio.NewWriter(connection)
+			tlsActive = true
 			continue
 		case cancelRequestCode:
 			server.handleCancel(startup)
 			_ = connection.Close()
 			return
 		case protocolVersion3:
+			if server.config.AuthMode == CleartextPasswordAuth && !tlsActive && !server.config.AllowInsecurePasswords {
+				_ = writeError(writer, "28000", fmt.Errorf("password authentication requires TLS"))
+				_ = connection.Close()
+				return
+			}
 			parameters, err := parseStartupParameters(startup)
 			if err != nil {
 				_ = writeError(writer, "08P01", err)

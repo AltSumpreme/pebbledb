@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log"
 	"net"
@@ -22,8 +23,10 @@ func main() {
 	address := flag.String("listen", "127.0.0.1:5432", "PostgreSQL listen address")
 	adminAddress := flag.String("admin", "127.0.0.1:8080", "HTTP health/metrics listen address (empty disables)")
 	auth := flag.String("auth", "trust", "authentication mode: trust or password")
-	user := flag.String("user", "", "required PostgreSQL user (empty accepts any user)")
-	password := flag.String("password", "", "cleartext authentication password")
+	user := flag.String("user", "", "required PostgreSQL user (mandatory in password mode)")
+	password := flag.String("password", "", "authentication password (mandatory in password mode)")
+	tlsCertificate := flag.String("tls-cert", "", "TLS certificate path (required with -tls-key)")
+	tlsKey := flag.String("tls-key", "", "TLS private key path (required with -tls-cert)")
 	flag.Parse()
 
 	database, err := engine.Open(*dataDirectory)
@@ -37,7 +40,18 @@ func main() {
 	} else if !strings.EqualFold(*auth, "trust") {
 		log.Fatalf("unsupported authentication mode %q", *auth)
 	}
-	server, err := pgwire.New(database, pgwire.Config{AuthMode: authMode, User: *user, Password: *password})
+	var tlsConfig *tls.Config
+	if (*tlsCertificate == "") != (*tlsKey == "") {
+		log.Fatal("-tls-cert and -tls-key must be provided together")
+	}
+	if *tlsCertificate != "" {
+		certificate, err := tls.LoadX509KeyPair(*tlsCertificate, *tlsKey)
+		if err != nil {
+			log.Fatalf("load TLS key pair: %v", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	}
+	server, err := pgwire.New(database, pgwire.Config{AuthMode: authMode, User: *user, Password: *password, TLSConfig: tlsConfig})
 	if err != nil {
 		log.Fatalf("configure PostgreSQL server: %v", err)
 	}

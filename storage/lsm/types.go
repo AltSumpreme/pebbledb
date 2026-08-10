@@ -23,6 +23,7 @@ var (
 	ErrKeyTooLarge   = errors.New("lsm: key is too large")
 	ErrValueTooLarge = errors.New("lsm: value is too large")
 	ErrInvalidRange  = errors.New("lsm: range start must not sort after range end")
+	ErrLocked        = errors.New("lsm: directory is already open by another process or store")
 )
 
 // Options controls a Store. Zero values select safe defaults.

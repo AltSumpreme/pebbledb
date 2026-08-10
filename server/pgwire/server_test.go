@@ -4,7 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"io"
+	"math/big"
 	"net"
 	"sync"
 	"testing"
@@ -109,7 +117,7 @@ func TestSimpleAndExtendedQueryProtocols(t *testing.T) {
 }
 
 func TestCleartextAuthenticationAndTransactionStatus(t *testing.T) {
-	database, _, address := startTestServer(t, Config{AuthMode: CleartextPasswordAuth, User: "reuben", Password: "secret"})
+	database, _, address := startTestServer(t, Config{AuthMode: CleartextPasswordAuth, User: "reuben", Password: "secret", AllowInsecurePasswords: true})
 	defer database.Close()
 	connection, reader, writer, _ := connect(t, address, "reuben", "secret")
 	defer connection.Close()
@@ -136,6 +144,112 @@ func TestCleartextAuthenticationAndTransactionStatus(t *testing.T) {
 		t.Fatalf("bad password response=%q", response.kind)
 	}
 	_ = bad.Close()
+}
+
+func TestPasswordAuthenticationRequiresTLSByDefault(t *testing.T) {
+	database, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if _, err := New(database, Config{AuthMode: CleartextPasswordAuth, User: "reuben", Password: "secret"}); err == nil {
+		t.Fatal("insecure password server unexpectedly configured")
+	}
+	if _, err := New(database, Config{AuthMode: CleartextPasswordAuth, AllowInsecurePasswords: true}); err == nil {
+		t.Fatal("empty password credentials unexpectedly configured")
+	}
+	if _, err := New(database, Config{TLSConfig: &tls.Config{}}); err == nil {
+		t.Fatal("TLS without a certificate unexpectedly configured")
+	}
+}
+
+func TestTLSNegotiationProtectsPasswordAuthentication(t *testing.T) {
+	certificate, root := testTLSCertificate(t)
+	database, _, address := startTestServer(t, Config{
+		AuthMode:  CleartextPasswordAuth,
+		User:      "reuben",
+		Password:  "secret",
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}},
+	})
+	defer database.Close()
+	unsecured, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsecuredReader, unsecuredWriter := bufio.NewReader(unsecured), bufio.NewWriter(unsecured)
+	sendStartup(t, unsecuredWriter, "reuben")
+	if message := receive(t, unsecuredReader); message.kind != 'E' {
+		t.Fatalf("unencrypted password startup response = %q, want error", message.kind)
+	}
+	_ = unsecured.Close()
+
+	plain, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request bytes.Buffer
+	_ = binary.Write(&request, binary.BigEndian, int32(8))
+	_ = binary.Write(&request, binary.BigEndian, int32(sslRequestCode))
+	if _, err := plain.Write(request.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	var response [1]byte
+	if _, err := io.ReadFull(plain, response[:]); err != nil {
+		t.Fatal(err)
+	}
+	if response[0] != 'S' {
+		t.Fatalf("SSL response = %q, want S", response[0])
+	}
+	secured := tls.Client(plain, &tls.Config{RootCAs: root, ServerName: "localhost", MinVersion: tls.VersionTLS12})
+	if err := secured.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	defer secured.Close()
+	if secured.ConnectionState().Version < tls.VersionTLS12 {
+		t.Fatalf("negotiated insecure TLS version %x", secured.ConnectionState().Version)
+	}
+	reader, writer := bufio.NewReader(secured), bufio.NewWriter(secured)
+	sendStartup(t, writer, "reuben")
+	for {
+		message := receive(t, reader)
+		if message.kind == 'R' && binary.BigEndian.Uint32(message.payload) == 3 {
+			sendFrontend(t, writer, 'p', cstring("secret"))
+		}
+		if message.kind == 'E' {
+			t.Fatalf("TLS startup error: %q", message.payload)
+		}
+		if message.kind == 'Z' {
+			break
+		}
+	}
+}
+
+func testTLSCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		DNSNames:     []string{"localhost"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	encoded, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(parsed)
+	return tls.Certificate{Certificate: [][]byte{encoded}, PrivateKey: privateKey, Leaf: parsed}, roots
 }
 
 type startupInfo struct{ backendPID, secret uint32 }
