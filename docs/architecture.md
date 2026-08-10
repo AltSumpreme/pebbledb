@@ -86,9 +86,13 @@ tests for any persistent format it introduces.
    - Idempotent default bootstrap, normalized name resolution, sorted listings,
      complete table description, dependency-safe drops, revision tracking,
      concurrent DDL serialization, and restart/corruption coverage.
-4. **SQL frontend**
-   - Standards-shaped lexer/parser and typed AST for DDL and DML.
-   - Binder resolves names and types exclusively through a catalog interface.
+4. **SQL frontend (implemented)**
+   - Source-positioned lexer, independent typed AST, precedence parser, standard
+     DDL/DML forms, expressions, functions, multi-statement input, comments,
+     SQL string escaping, and transaction statements.
+   - Catalog-backed binder resolves qualified tables and columns, expands stars,
+     validates predicates/functions/assignments, and contextually coerces typed
+     INSERT, UPDATE, comparison, and exact-decimal literals.
 5. **Planning and local execution**
    - Logical and physical plans; scan, values, filter, project, limit, sort,
      insert, update, delete, aggregate, and join operators.
@@ -123,8 +127,8 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 4 starts with a typed SQL AST and binder over the persistent catalog.
-The first end-to-end vertical path will be:
+Milestone 5 starts with logical/physical plans and local execution over the bound
+SQL representation. The first end-to-end vertical path will be:
 
 ```text
 CREATE TABLE -> catalog records in LSM
