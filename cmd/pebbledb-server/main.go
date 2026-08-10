@@ -22,9 +22,10 @@ func main() {
 	dataDirectory := flag.String("data", "pebbledb-data", "database storage directory")
 	address := flag.String("listen", "127.0.0.1:5432", "PostgreSQL listen address")
 	adminAddress := flag.String("admin", "127.0.0.1:8080", "HTTP health/metrics listen address (empty disables)")
-	auth := flag.String("auth", "trust", "authentication mode: trust or password")
-	user := flag.String("user", "", "required PostgreSQL user (mandatory in password mode)")
-	password := flag.String("password", "", "authentication password (mandatory in password mode)")
+	auth := flag.String("auth", "trust", "authentication mode: trust, password, or scram")
+	user := flag.String("user", "", "required PostgreSQL user (mandatory in password and scram modes)")
+	password := flag.String("password", "", "authentication password (or use -scram-verifier in scram mode)")
+	scramVerifier := flag.String("scram-verifier", "", "PostgreSQL SCRAM-SHA-256 verifier (alternative to -password in scram mode)")
 	tlsCertificate := flag.String("tls-cert", "", "TLS certificate path (required with -tls-key)")
 	tlsKey := flag.String("tls-key", "", "TLS private key path (required with -tls-cert)")
 	flag.Parse()
@@ -37,6 +38,8 @@ func main() {
 	authMode := pgwire.TrustAuth
 	if strings.EqualFold(*auth, "password") {
 		authMode = pgwire.CleartextPasswordAuth
+	} else if strings.EqualFold(*auth, "scram") {
+		authMode = pgwire.SCRAMSHA256Auth
 	} else if !strings.EqualFold(*auth, "trust") {
 		log.Fatalf("unsupported authentication mode %q", *auth)
 	}
@@ -51,7 +54,13 @@ func main() {
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
 	}
-	server, err := pgwire.New(database, pgwire.Config{AuthMode: authMode, User: *user, Password: *password, TLSConfig: tlsConfig})
+	server, err := pgwire.New(database, pgwire.Config{
+		AuthMode: authMode, User: *user, Password: *password,
+		SCRAMVerifier: *scramVerifier, TLSConfig: tlsConfig,
+	})
+	if authMode == pgwire.SCRAMSHA256Auth {
+		*password = ""
+	}
 	if err != nil {
 		log.Fatalf("configure PostgreSQL server: %v", err)
 	}

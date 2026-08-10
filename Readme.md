@@ -14,7 +14,7 @@ ordered LSM store.
 ## Implemented foundations
 
 - PostgreSQL v3 simple and extended query protocols, cancellation, TLS, and
-  trust or password authentication.
+  trust, TLS-protected password, or SCRAM-SHA-256 authentication.
 - Typed SQL parsing, binding, planning, execution, catalog metadata, joins,
   aggregates, DDL/DML, secondary indexes, and `EXPLAIN`.
 - Serializable MVCC transactions with snapshots, conflict detection, and atomic
@@ -59,6 +59,19 @@ go run ./cmd/pebbledb-server \
   -tls-cert ./server.crt -tls-key ./server.key
 ```
 
+SCRAM-SHA-256 avoids retaining the plaintext password in the running server
+configuration and can also load a PostgreSQL-format verifier:
+
+```bash
+go run ./cmd/pebbledb-server \
+  -data ./pebbledb-data \
+  -auth scram -user pebbledb -password change-me \
+  -tls-cert ./server.crt -tls-key ./server.key
+
+# Or replace -password with:
+# -scram-verifier 'SCRAM-SHA-256$4096:<salt>$<stored-key>:<server-key>'
+```
+
 The admin listener provides `/healthz`, `/status`, and `/metrics`.
 
 ## SQL example
@@ -94,8 +107,8 @@ executes one iteration of every storage/SQL benchmark. Individual targets are
 
 - The SQL dialect and PostgreSQL catalogs/types are a subset, not drop-in
   PostgreSQL compatibility.
-- SCRAM authentication, certificate rotation, rolling format migrations, and
-  automated restore orchestration are not implemented.
+- Certificate rotation, rolling format migrations, and automated restore
+  orchestration are not implemented.
 - The durable distributed-commit component is not yet wired into the SQL range
   mutation path, so cross-range SQL writes remain fail-closed.
 - Placement actions expose an orchestration boundary; production-grade node

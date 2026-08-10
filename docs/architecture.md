@@ -159,9 +159,11 @@ tests for any persistent format it introduces.
       cancellation are raw-protocol integration tested.
     - PostgreSQL SSLRequest negotiation supports configured certificates and
       TLS 1.2 or newer. Password authentication is rejected without TLS unless
-      an explicit development-only override is selected. SCRAM, PostgreSQL
-      system catalogs, and simultaneous explicit transactions from multiple
-      sessions remain compatibility gaps.
+      an explicit development-only override is selected. SCRAM-SHA-256 supports
+      PostgreSQL-format verifiers, bounded PBKDF2 iteration counts, complete
+      client/server proof validation, and does not retain a configured plaintext
+      password. PostgreSQL system catalogs and simultaneous explicit
+      transactions from multiple sessions remain compatibility gaps.
 13. **Chaos, recovery, and observability (implemented)**
     - Seeded multi-epoch Raft simulations inject availability loss and network
       partitions, force elections/log repair, and continuously verify every
@@ -195,8 +197,8 @@ tests for any persistent format it introduces.
     - `make verify` builds all packages, runs unit/integration and race suites,
       runs `go vet`, and smokes every storage/SQL benchmark. The existing CI
       continues to enforce its build and unit-test checks.
-    - SCRAM, certificate rotation, rolling format migrations, automated restore,
-      and SQL/range/Raft integration of distributed commits remain production
+    - Certificate rotation, rolling format migrations, automated restore, and
+      SQL/range/Raft integration of distributed commits remain production
       hardening work; the repository must not yet be treated as production-ready.
 
 PostgreSQL wire support is intentionally late in the dependency chain but can be

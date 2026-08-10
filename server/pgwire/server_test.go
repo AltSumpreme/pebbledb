@@ -7,13 +7,17 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
 	"io"
 	"math/big"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -222,6 +226,140 @@ func TestTLSNegotiationProtectsPasswordAuthentication(t *testing.T) {
 			break
 		}
 	}
+}
+
+func TestSCRAMSHA256AuthenticationWithPasswordAndVerifier(t *testing.T) {
+	database, server, address := startTestServer(t, Config{AuthMode: SCRAMSHA256Auth, User: "reuben", Password: "pencil"})
+	if server.config.Password != "" {
+		t.Fatal("SCRAM server retained plaintext password")
+	}
+	scramConnect(t, address, "reuben", "pencil", true)
+	scramConnect(t, address, "reuben", "wrong-password", false)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	verifier, err := GenerateSCRAMVerifier("pencil", 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifierDatabase, _, verifierAddress := startTestServer(t, Config{AuthMode: SCRAMSHA256Auth, User: "reuben", SCRAMVerifier: verifier})
+	defer verifierDatabase.Close()
+	scramConnect(t, verifierAddress, "reuben", "pencil", true)
+}
+
+func TestSCRAMVerifierValidationAndKnownDerivation(t *testing.T) {
+	const verifier = "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$zHCdol2044/ZyWzPLi7oxApCkamKw9Z+E4U/QApd/5Y=:dd5peBOitVnLNFu7VmwP+HiDaaw4OUCv396eVCWhYiE="
+	credential, err := parseSCRAMVerifier(verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedKey, serverKey := scramKeys("pencil", credential.salt, credential.iterations)
+	if subtleCompare(storedKey, credential.storedKey) == false || subtleCompare(serverKey, credential.serverKey) == false {
+		t.Fatal("SCRAM SHA-256 derivation does not match known verifier")
+	}
+	for _, invalid := range []string{
+		"", "SCRAM-SHA-1$4096:salt$stored:server",
+		"SCRAM-SHA-256$1:AAECAwQFBgcICQoLDA0ODw==$zHCdol2044/ZyWzPLi7oxApCkamKw9Z+E4U/QApd/5Y=:dd5peBOitVnLNFu7VmwP+HiDaaw4OUCv396eVCWhYiE=",
+	} {
+		if _, err := parseSCRAMVerifier(invalid); err == nil {
+			t.Fatalf("invalid verifier accepted: %q", invalid)
+		}
+	}
+}
+
+func scramConnect(t *testing.T, address, user, password string, success bool) {
+	t.Helper()
+	connection, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	reader, writer := bufio.NewReader(connection), bufio.NewWriter(connection)
+	sendStartup(t, writer, user)
+	request := receive(t, reader)
+	if request.kind != 'R' || len(request.payload) < 6 || binary.BigEndian.Uint32(request.payload[:4]) != 10 || string(request.payload[4:]) != scramMechanism+"\x00\x00" {
+		t.Fatalf("SCRAM mechanism request = %q %v", request.kind, request.payload)
+	}
+	clientNonce := "pebbledb-client-nonce"
+	clientFirstBare := "n=,r=" + clientNonce
+	clientFirst := "n,," + clientFirstBare
+	var initial bytes.Buffer
+	initial.Write(cstring(scramMechanism))
+	_ = binary.Write(&initial, binary.BigEndian, int32(len(clientFirst)))
+	initial.WriteString(clientFirst)
+	sendFrontend(t, writer, 'p', initial.Bytes())
+
+	continuation := receive(t, reader)
+	if continuation.kind != 'R' || len(continuation.payload) < 5 || binary.BigEndian.Uint32(continuation.payload[:4]) != 11 {
+		t.Fatalf("SCRAM continuation = %q %v", continuation.kind, continuation.payload)
+	}
+	serverFirst := string(continuation.payload[4:])
+	attributes, err := parseSCRAMAttributes(serverFirst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(attributes['r'], clientNonce) {
+		t.Fatalf("server nonce %q does not extend client nonce", attributes['r'])
+	}
+	salt, err := base64.StdEncoding.DecodeString(attributes['s'])
+	if err != nil {
+		t.Fatal(err)
+	}
+	iterations, err := strconv.Atoi(attributes['i'])
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientFinalWithoutProof := "c=biws,r=" + attributes['r']
+	authMessage := clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof
+	saltedPassword := scramPBKDF2([]byte(password), salt, iterations)
+	clientKey := scramHMAC(saltedPassword, []byte("Client Key"))
+	storedKey := sha256.Sum256(clientKey)
+	clientSignature := scramHMAC(storedKey[:], []byte(authMessage))
+	proof := make([]byte, sha256.Size)
+	for index := range proof {
+		proof[index] = clientKey[index] ^ clientSignature[index]
+	}
+	clientFinal := clientFinalWithoutProof + ",p=" + base64.StdEncoding.EncodeToString(proof)
+	sendFrontend(t, writer, 'p', []byte(clientFinal))
+
+	response := receive(t, reader)
+	if !success {
+		if response.kind != 'E' {
+			t.Fatalf("failed SCRAM response = %q, want error", response.kind)
+		}
+		return
+	}
+	if response.kind != 'R' || binary.BigEndian.Uint32(response.payload[:4]) != 12 {
+		t.Fatalf("SCRAM final = %q %v", response.kind, response.payload)
+	}
+	expectedServerSignature := base64.StdEncoding.EncodeToString(scramHMAC(scramHMAC(saltedPassword, []byte("Server Key")), []byte(authMessage)))
+	if string(response.payload[4:]) != "v="+expectedServerSignature {
+		t.Fatalf("server signature = %q, want %q", response.payload[4:], expectedServerSignature)
+	}
+	if authenticated := receive(t, reader); authenticated.kind != 'R' || binary.BigEndian.Uint32(authenticated.payload) != 0 {
+		t.Fatalf("authentication completion = %q %v", authenticated.kind, authenticated.payload)
+	}
+	for {
+		message := receive(t, reader)
+		if message.kind == 'E' {
+			t.Fatalf("SCRAM startup error: %q", message.payload)
+		}
+		if message.kind == 'Z' {
+			return
+		}
+	}
+}
+
+func subtleCompare(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	var difference byte
+	for index := range left {
+		difference |= left[index] ^ right[index]
+	}
+	return difference == 0
 }
 
 func testTLSCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {

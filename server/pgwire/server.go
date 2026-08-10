@@ -23,12 +23,16 @@ type AuthMode uint8
 const (
 	TrustAuth AuthMode = iota + 1
 	CleartextPasswordAuth
+	SCRAMSHA256Auth
 )
 
 type Config struct {
-	AuthMode        AuthMode
-	User            string
-	Password        string
+	AuthMode AuthMode
+	User     string
+	Password string
+	// SCRAMVerifier is a PostgreSQL-compatible SCRAM-SHA-256 verifier. Set
+	// either Password or SCRAMVerifier in SCRAM mode, never both.
+	SCRAMVerifier   string
 	ServerVersion   string
 	MaxMessageBytes int
 	TLSConfig       *tls.Config
@@ -63,6 +67,7 @@ type Server struct {
 
 	executionMu sync.Mutex
 	txOwner     uint32
+	scram       *scramCredential
 }
 
 func New(database *engine.Engine, config Config) (*Server, error) {
@@ -70,11 +75,27 @@ func New(database *engine.Engine, config Config) (*Server, error) {
 		return nil, fmt.Errorf("pgwire: SQL engine is required")
 	}
 	config = config.normalized()
-	if config.AuthMode != TrustAuth && config.AuthMode != CleartextPasswordAuth {
+	if config.AuthMode != TrustAuth && config.AuthMode != CleartextPasswordAuth && config.AuthMode != SCRAMSHA256Auth {
 		return nil, fmt.Errorf("pgwire: unsupported authentication mode")
 	}
 	if config.AuthMode == CleartextPasswordAuth && (config.User == "" || config.Password == "") {
 		return nil, fmt.Errorf("pgwire: password authentication requires a non-empty user and password")
+	}
+	var scram *scramCredential
+	if config.AuthMode == SCRAMSHA256Auth {
+		if config.User == "" || (config.Password == "") == (config.SCRAMVerifier == "") {
+			return nil, fmt.Errorf("pgwire: SCRAM requires a user and exactly one password or verifier")
+		}
+		var err error
+		if config.SCRAMVerifier != "" {
+			scram, err = parseSCRAMVerifier(config.SCRAMVerifier)
+		} else {
+			scram, err = newSCRAMCredential(config.Password, defaultSCRAMIterations)
+		}
+		if err != nil {
+			return nil, err
+		}
+		config.Password = ""
 	}
 	if config.AuthMode == CleartextPasswordAuth && config.TLSConfig == nil && !config.AllowInsecurePasswords {
 		return nil, fmt.Errorf("pgwire: cleartext-password authentication requires TLS")
@@ -88,7 +109,7 @@ func New(database *engine.Engine, config Config) (*Server, error) {
 			config.TLSConfig.MinVersion = tls.VersionTLS12
 		}
 	}
-	server := &Server{engine: database, config: config, clients: make(map[uint32]*client)}
+	server := &Server{engine: database, config: config, clients: make(map[uint32]*client), scram: scram}
 	server.nextPID.Store(1000)
 	return server, nil
 }
@@ -218,6 +239,9 @@ func (server *Server) authenticate(reader *bufio.Reader, writer *bufio.Writer, p
 	}
 	if server.config.AuthMode == TrustAuth {
 		return writeMessage(writer, 'R', authentication(0))
+	}
+	if server.config.AuthMode == SCRAMSHA256Auth {
+		return server.authenticateSCRAM(reader, writer)
 	}
 	if err := writeMessage(writer, 'R', authentication(3)); err != nil {
 		return err
