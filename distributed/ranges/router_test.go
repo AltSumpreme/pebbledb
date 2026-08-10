@@ -92,6 +92,41 @@ func TestCrossRangeBatchIsRejectedAtomically(t *testing.T) {
 	}
 }
 
+func TestMoveAndMergePublishDurablePlacements(t *testing.T) {
+	root := t.TempDir()
+	metadata := openStore(t, filepath.Join(root, "meta"))
+	first := openStore(t, filepath.Join(root, "first"))
+	second := openStore(t, filepath.Join(root, "second"))
+	third := openStore(t, filepath.Join(root, "third"))
+	router, err := Open(metadata, Replica{ID: 1, Store: first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = router.Put([]byte("a"), []byte("left"))
+	_ = router.Put([]byte("z"), []byte("right"))
+	left, right, err := router.Split([]byte("m"), 2, Replica{ID: 2, Store: second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := router.Move(right.ID, Replica{ID: 3, Store: third})
+	if err != nil || moved.ReplicaID != 3 || moved.Generation != right.Generation+1 {
+		t.Fatalf("move = %+v, %v", moved, err)
+	}
+	assertValue(t, router, "z", "right")
+	if _, found, _ := second.Get([]byte("z")); found {
+		t.Fatal("move left a source copy")
+	}
+	merged, err := router.Merge(left.ID, moved.ID)
+	if err != nil || len(merged.End) != 0 || len(router.Descriptors()) != 1 {
+		t.Fatalf("merge = %+v descriptors=%+v err=%v", merged, router.Descriptors(), err)
+	}
+	assertValue(t, router, "a", "left")
+	assertValue(t, router, "z", "right")
+	if _, found, _ := third.Get([]byte("z")); found {
+		t.Fatal("merge left a source copy")
+	}
+}
+
 func TestDescriptorCorruptionAndMissingReplicaAreRejected(t *testing.T) {
 	metadata := openStore(t, filepath.Join(t.TempDir(), "meta"))
 	data := openStore(t, filepath.Join(t.TempDir(), "data"))

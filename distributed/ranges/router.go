@@ -266,6 +266,102 @@ func (router *Router) Split(splitKey []byte, rightRangeID uint64, right Replica)
 	return cloneDescriptor(updatedLeft), cloneDescriptor(rightDescriptor), nil
 }
 
+// Move copies a range to another replica before atomically publishing the new
+// placement. The old copy is removed only after routing changes.
+func (router *Router) Move(rangeID uint64, target Replica) (Descriptor, error) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	if target.ID == 0 || target.Store == nil {
+		return Descriptor{}, fmt.Errorf("ranges: target replica is required")
+	}
+	descriptor := router.byIDLocked(rangeID)
+	if descriptor == nil {
+		return Descriptor{}, ErrNoRange
+	}
+	if descriptor.ReplicaID == target.ID {
+		return cloneDescriptor(*descriptor), nil
+	}
+	if existing, ok := router.replicas[target.ID]; ok {
+		target.Store = existing
+	}
+	if entries, err := target.Store.Scan(descriptor.Start, descriptor.End); err != nil {
+		return Descriptor{}, err
+	} else if len(userEntries(entries)) != 0 {
+		return Descriptor{}, fmt.Errorf("ranges: move destination is not empty")
+	}
+	source := router.replicas[descriptor.ReplicaID]
+	entries, err := source.Scan(descriptor.Start, descriptor.End)
+	if err != nil {
+		return Descriptor{}, fmt.Errorf("ranges: scan move source: %w", err)
+	}
+	entries = userEntries(entries)
+	if err := applyEntries(target.Store, entries, false); err != nil {
+		return Descriptor{}, fmt.Errorf("ranges: copy move data: %w", err)
+	}
+	updated := cloneDescriptor(*descriptor)
+	updated.ReplicaID, updated.Generation = target.ID, updated.Generation+1
+	encoded, _ := encodeDescriptor(updated)
+	if err := router.metadata.Apply([]kv.Mutation{{Key: descriptorKey(updated.ID), Value: encoded}}); err != nil {
+		return Descriptor{}, fmt.Errorf("ranges: publish move: %w", err)
+	}
+	router.replicas[target.ID] = target.Store
+	*descriptor = updated
+	if err := applyEntries(source, entries, true); err != nil {
+		return cloneDescriptor(updated), fmt.Errorf("ranges: move published but source cleanup failed: %w", err)
+	}
+	return cloneDescriptor(updated), nil
+}
+
+// Merge combines two adjacent ranges. Right-hand data is copied first when the
+// placements differ, then one descriptor is atomically published and the other
+// removed.
+func (router *Router) Merge(leftRangeID, rightRangeID uint64) (Descriptor, error) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	left, right := router.byIDLocked(leftRangeID), router.byIDLocked(rightRangeID)
+	if left == nil || right == nil || !bytes.Equal(left.End, right.Start) {
+		return Descriptor{}, fmt.Errorf("ranges: merge requires adjacent left and right ranges")
+	}
+	leftStore, rightStore := router.replicas[left.ReplicaID], router.replicas[right.ReplicaID]
+	entries, err := rightStore.Scan(right.Start, right.End)
+	if err != nil {
+		return Descriptor{}, fmt.Errorf("ranges: scan merge source: %w", err)
+	}
+	entries = userEntries(entries)
+	if left.ReplicaID != right.ReplicaID {
+		if existing, err := leftStore.Scan(right.Start, right.End); err != nil {
+			return Descriptor{}, err
+		} else if len(userEntries(existing)) != 0 {
+			return Descriptor{}, fmt.Errorf("ranges: merge destination contains conflicting data")
+		}
+		if err := applyEntries(leftStore, entries, false); err != nil {
+			return Descriptor{}, fmt.Errorf("ranges: copy merge data: %w", err)
+		}
+	}
+	updated := cloneDescriptor(*left)
+	updated.End, updated.Generation = clone(right.End), updated.Generation+1
+	encoded, _ := encodeDescriptor(updated)
+	if err := router.metadata.Apply([]kv.Mutation{
+		{Key: descriptorKey(updated.ID), Value: encoded},
+		{Key: descriptorKey(right.ID), Delete: true},
+	}); err != nil {
+		return Descriptor{}, fmt.Errorf("ranges: publish merge: %w", err)
+	}
+	*left = updated
+	for index := range router.descriptors {
+		if router.descriptors[index].ID == rightRangeID {
+			router.descriptors = append(router.descriptors[:index], router.descriptors[index+1:]...)
+			break
+		}
+	}
+	if left.ReplicaID != right.ReplicaID {
+		if err := applyEntries(rightStore, entries, true); err != nil {
+			return cloneDescriptor(updated), fmt.Errorf("ranges: merge published but source cleanup failed: %w", err)
+		}
+	}
+	return cloneDescriptor(updated), nil
+}
+
 func (router *Router) validateAndSort() error {
 	sort.Slice(router.descriptors, func(i, j int) bool {
 		return bytes.Compare(router.descriptors[i].Start, router.descriptors[j].Start) < 0

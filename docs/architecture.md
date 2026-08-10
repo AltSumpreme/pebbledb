@@ -138,9 +138,16 @@ tests for any persistent format it introduces.
       and typed global `COUNT`/`SUM` aggregation compose over those exchanges.
     - Cross-range mutations remain fail-closed; a recoverable distributed commit
       protocol is still required before enabling them.
-11. **Automatic placement**
-    - Replica placement, lease transfer, split/merge policy, hot-range detection,
-      and rebalancing.
+11. **Automatic placement (implemented)**
+    - A continuously runnable controller consumes node capacity/liveness and
+      range size/QPS heartbeats, maintains EWMA hot-range signals, and produces
+      deterministic add/remove/move replica, lease-transfer, split, and merge
+      actions under bounded per-cycle admission.
+    - Safety ordering restores replication before balancing; targets exclude
+      existing replicas and prefer live low-utilization nodes. Persistent range
+      `Move` and `Merge` primitives copy before metadata publication and clean
+      obsolete source copies afterward. An orchestrator boundary owns external
+      node provisioning and Raft membership changes.
 12. **PostgreSQL compatibility**
     - Startup/authentication, simple and extended query protocols, PostgreSQL
       type/result encoding, sessions, prepared statements, and cancellation.
@@ -153,8 +160,8 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 11 introduces automatic placement, hot-range policy, and rebalancing.
-The completed read path is:
+Milestone 12 introduces PostgreSQL wire compatibility and session state. The
+completed distributed read path is:
 
 ```text
 optimized SQL scan -> range span derivation -> admitted remote processors
