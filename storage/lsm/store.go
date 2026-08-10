@@ -18,15 +18,21 @@ const walFilename = "wal.log"
 // Store is a durable ordered key-value store backed by a WAL, a memtable, and
 // immutable SSTables. Store methods are safe for concurrent use.
 type Store struct {
-	mu             sync.RWMutex
-	directory      string
-	options        Options
-	wal            *writeAheadLog
-	memtable       map[string]mutation
-	memtableBytes  int
-	tables         []*sstable // oldest to newest
-	nextGeneration uint64
-	closed         bool
+	mu                    sync.RWMutex
+	directory             string
+	options               Options
+	wal                   *writeAheadLog
+	memtable              map[string]mutation
+	memtableBytes         int
+	tables                []*sstable // oldest to newest
+	nextGeneration        uint64
+	closed                bool
+	closing               bool
+	cache                 *blockCache
+	maintenance           chan struct{}
+	stopMaintenance       chan struct{}
+	maintenanceDone       sync.WaitGroup
+	backgroundCompactions uint64
 }
 
 // Open opens or creates a Store in directory. At most one Options value may be
@@ -52,16 +58,19 @@ func Open(directory string, supplied ...Options) (*Store, error) {
 		return nil, fmt.Errorf("create LSM directory: %w", err)
 	}
 
-	tables, maxGeneration, err := loadSSTables(directory)
+	tables, maxGeneration, err := loadSSTables(directory, options.BloomBitsPerKey)
 	if err != nil {
 		return nil, err
 	}
 	store := &Store{
-		directory:      directory,
-		options:        options,
-		memtable:       make(map[string]mutation),
-		tables:         tables,
-		nextGeneration: maxGeneration + 1,
+		directory:       directory,
+		options:         options,
+		memtable:        make(map[string]mutation),
+		tables:          tables,
+		nextGeneration:  maxGeneration + 1,
+		cache:           newBlockCache(options.BlockCacheBytes),
+		maintenance:     make(chan struct{}, 1),
+		stopMaintenance: make(chan struct{}),
 	}
 	if store.nextGeneration == 0 {
 		closeSSTables(tables)
@@ -72,6 +81,10 @@ func Open(directory string, supplied ...Options) (*Store, error) {
 	if err != nil {
 		closeSSTables(tables)
 		return nil, err
+	}
+	if !options.DisableBackgroundCompaction {
+		store.maintenanceDone.Add(1)
+		go store.maintain()
 	}
 	return store, nil
 }
@@ -84,7 +97,7 @@ func (store *Store) Put(key, value []byte) error {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return ErrClosed
 	}
 	if err := store.wal.append(key, value, false); err != nil {
@@ -104,7 +117,7 @@ func (store *Store) Delete(key []byte) error {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return ErrClosed
 	}
 	if err := store.wal.append(key, nil, true); err != nil {
@@ -141,7 +154,7 @@ func (store *Store) Apply(mutations []kv.Mutation) error {
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return ErrClosed
 	}
 	if err := store.wal.appendBatch(entries); err != nil {
@@ -162,7 +175,7 @@ func (store *Store) Get(key []byte) (value []byte, found bool, err error) {
 	}
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return nil, false, ErrClosed
 	}
 	keyString := string(key)
@@ -173,7 +186,7 @@ func (store *Store) Get(key []byte) (value []byte, found bool, err error) {
 		return cloneBytes(entry.value), true, nil
 	}
 	for i := len(store.tables) - 1; i >= 0; i-- {
-		entry, ok, err := store.tables[i].get(keyString)
+		entry, ok, err := store.tables[i].get(keyString, store.cache)
 		if err != nil {
 			return nil, false, err
 		}
@@ -201,7 +214,7 @@ func (store *Store) Scan(start, end []byte) ([]Entry, error) {
 
 	store.mu.RLock()
 	defer store.mu.RUnlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return nil, ErrClosed
 	}
 	resolved := make(map[string]mutation)
@@ -241,7 +254,7 @@ func (store *Store) Scan(start, end []byte) ([]Entry, error) {
 func (store *Store) Flush() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return ErrClosed
 	}
 	return store.flushLocked()
@@ -251,7 +264,7 @@ func (store *Store) flushLocked() error {
 	if len(store.memtable) == 0 {
 		return nil
 	}
-	table, err := writeSSTable(store.directory, store.nextGeneration, store.memtable)
+	table, err := writeSSTable(store.directory, store.nextGeneration, store.memtable, store.options.BloomBitsPerKey)
 	if err != nil {
 		return err
 	}
@@ -269,6 +282,7 @@ func (store *Store) flushLocked() error {
 	}
 	store.memtable = make(map[string]mutation)
 	store.memtableBytes = 0
+	store.requestMaintenanceLocked()
 	return nil
 }
 
@@ -277,7 +291,7 @@ func (store *Store) flushLocked() error {
 func (store *Store) Compact() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return ErrClosed
 	}
 	if err := store.flushLocked(); err != nil {
@@ -297,7 +311,7 @@ func (store *Store) Compact() error {
 			resolved[key] = entry
 		}
 	}
-	compacted, err := writeSSTable(store.directory, store.nextGeneration, resolved)
+	compacted, err := writeSSTable(store.directory, store.nextGeneration, resolved, store.options.BloomBitsPerKey)
 	if err != nil {
 		return err
 	}
@@ -311,6 +325,7 @@ func (store *Store) Compact() error {
 	store.tables = []*sstable{compacted}
 	var cleanupErrors []error
 	for _, table := range oldTables {
+		store.cache.removeGeneration(table.generation)
 		if err := table.close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("close old SSTable: %w", err))
 			continue
@@ -370,7 +385,7 @@ func (store *Store) Checkpoint(destination string) error {
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
 		return ErrClosed
 	}
 	if err := store.flushLocked(); err != nil {
@@ -429,20 +444,35 @@ func copyDurableFile(source, destination string) error {
 func (store *Store) Stats() Stats {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
+	cacheEntries, cacheBytes, cacheHits, cacheMisses := store.cache.stats()
+	var bloomRejections uint64
+	for _, table := range store.tables {
+		bloomRejections += table.bloomRejections.Load()
+	}
 	return Stats{
 		MemtableEntries: len(store.memtable),
 		MemtableBytes:   store.memtableBytes,
 		SSTables:        len(store.tables),
+		CacheEntries:    cacheEntries, CacheBytes: cacheBytes,
+		CacheHits: cacheHits, CacheMisses: cacheMisses,
+		BloomRejections:       bloomRejections,
+		BackgroundCompactions: store.backgroundCompactions,
 	}
 }
 
 // Close flushes pending writes and releases file handles. It is idempotent.
 func (store *Store) Close() error {
 	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.closed {
+	if store.closed || store.closing {
+		store.mu.Unlock()
 		return nil
 	}
+	store.closing = true
+	store.mu.Unlock()
+	close(store.stopMaintenance)
+	store.maintenanceDone.Wait()
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	var closeErrors []error
 	if err := store.flushLocked(); err != nil {
 		closeErrors = append(closeErrors, err)
@@ -456,7 +486,34 @@ func (store *Store) Close() error {
 		}
 	}
 	store.closed = true
+	store.closing = false
 	return errors.Join(closeErrors...)
+}
+
+func (store *Store) requestMaintenanceLocked() {
+	if store.options.DisableBackgroundCompaction || len(store.tables) < store.options.CompactionThreshold {
+		return
+	}
+	select {
+	case store.maintenance <- struct{}{}:
+	default:
+	}
+}
+
+func (store *Store) maintain() {
+	defer store.maintenanceDone.Done()
+	for {
+		select {
+		case <-store.maintenance:
+			if err := store.Compact(); err == nil {
+				store.mu.Lock()
+				store.backgroundCompactions++
+				store.mu.Unlock()
+			}
+		case <-store.stopMaintenance:
+			return
+		}
+	}
 }
 
 func (store *Store) applyMemtable(key string, entry mutation) {

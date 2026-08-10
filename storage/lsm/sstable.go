@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -26,13 +27,15 @@ type sstableIndexEntry struct {
 }
 
 type sstable struct {
-	generation uint64
-	path       string
-	file       *os.File
-	index      []sstableIndexEntry
+	generation      uint64
+	path            string
+	file            *os.File
+	index           []sstableIndexEntry
+	bloom           *bloomFilter
+	bloomRejections atomic.Uint64
 }
 
-func loadSSTables(directory string) ([]*sstable, uint64, error) {
+func loadSSTables(directory string, bloomBitsPerKey int) ([]*sstable, uint64, error) {
 	directoryEntries, err := os.ReadDir(directory)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read LSM directory: %w", err)
@@ -65,7 +68,7 @@ func loadSSTables(directory string) ([]*sstable, uint64, error) {
 	tables := make([]*sstable, 0, len(files))
 	var maxGeneration uint64
 	for _, file := range files {
-		table, err := openSSTable(file.path, file.generation)
+		table, err := openSSTable(file.path, file.generation, bloomBitsPerKey)
 		if err != nil {
 			closeSSTables(tables)
 			return nil, 0, err
@@ -91,7 +94,7 @@ func parseSSTableName(name string) (uint64, bool, error) {
 	return generation, true, nil
 }
 
-func openSSTable(path string, generation uint64) (*sstable, error) {
+func openSSTable(path string, generation uint64, bloomBitsPerKey int) (*sstable, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open SSTable %s: %w", filepath.Base(path), err)
@@ -186,10 +189,15 @@ func openSSTable(path string, generation uint64) (*sstable, error) {
 	if offset != info.Size() {
 		return fail(fmt.Errorf("lsm: SSTable %s contains trailing data", filepath.Base(path)))
 	}
+	keys := make([]string, len(table.index))
+	for index := range table.index {
+		keys[index] = table.index[index].key
+	}
+	table.bloom = newBloomFilter(keys, bloomBitsPerKey)
 	return table, nil
 }
 
-func writeSSTable(directory string, generation uint64, records map[string]mutation) (*sstable, error) {
+func writeSSTable(directory string, generation uint64, records map[string]mutation, bloomBitsPerKey int) (*sstable, error) {
 	keys := make([]string, 0, len(records))
 	for key := range records {
 		keys = append(keys, key)
@@ -256,17 +264,28 @@ func writeSSTable(directory string, generation uint64, records map[string]mutati
 	if err := syncDirectory(directory); err != nil {
 		return nil, fmt.Errorf("sync SSTable directory: %w", err)
 	}
-	return openSSTable(finalPath, generation)
+	return openSSTable(finalPath, generation, bloomBitsPerKey)
 }
 
-func (table *sstable) get(key string) (mutation, bool, error) {
+func (table *sstable) get(key string, cache *blockCache) (mutation, bool, error) {
+	if !table.bloom.mayContain([]byte(key)) {
+		table.bloomRejections.Add(1)
+		return mutation{}, false, nil
+	}
 	position := sort.Search(len(table.index), func(i int) bool {
 		return table.index[i].key >= key
 	})
 	if position == len(table.index) || table.index[position].key != key {
 		return mutation{}, false, nil
 	}
+	cacheID := cacheKey{generation: table.generation, key: key}
+	if entry, found := cache.get(cacheID); found {
+		return entry, true, nil
+	}
 	entry, err := table.readMutation(table.index[position])
+	if err == nil {
+		cache.put(cacheID, entry)
+	}
 	return entry, true, err
 }
 

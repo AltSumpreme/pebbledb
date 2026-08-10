@@ -12,6 +12,7 @@ import (
 
 const (
 	defaultMemtableSize = 4 << 20 // 4 MiB
+	defaultBlockCache   = 16 << 20
 	maxKeySize          = 1 << 20 // 1 MiB
 	maxValueSize        = 64 << 20
 )
@@ -29,14 +30,34 @@ type Options struct {
 	// MemtableSizeBytes is the approximate amount of pending key/value data that
 	// triggers an automatic flush to a new SSTable.
 	MemtableSizeBytes int
+	// BlockCacheBytes bounds cached SSTable values. Zero selects 16 MiB.
+	BlockCacheBytes int
+	// BloomBitsPerKey controls in-memory SSTable Bloom filters. Zero selects 10.
+	BloomBitsPerKey int
+	// CompactionThreshold schedules background compaction at this table count.
+	// Zero selects 8. Set DisableBackgroundCompaction for manual maintenance.
+	CompactionThreshold         int
+	DisableBackgroundCompaction bool
 }
 
 func (o Options) normalized() (Options, error) {
 	if o.MemtableSizeBytes < 0 {
 		return Options{}, errors.New("lsm: memtable size cannot be negative")
 	}
+	if o.BlockCacheBytes < 0 || o.BloomBitsPerKey < 0 || o.BloomBitsPerKey > 64 || o.CompactionThreshold < 0 {
+		return Options{}, errors.New("lsm: cache, Bloom, and compaction options cannot be negative or invalid")
+	}
 	if o.MemtableSizeBytes == 0 {
 		o.MemtableSizeBytes = defaultMemtableSize
+	}
+	if o.BlockCacheBytes == 0 {
+		o.BlockCacheBytes = defaultBlockCache
+	}
+	if o.BloomBitsPerKey == 0 {
+		o.BloomBitsPerKey = 10
+	}
+	if o.CompactionThreshold == 0 {
+		o.CompactionThreshold = 8
 	}
 	return o, nil
 }
@@ -48,9 +69,15 @@ type Entry = kv.Entry
 
 // Stats is a point-in-time view of the local storage state.
 type Stats struct {
-	MemtableEntries int
-	MemtableBytes   int
-	SSTables        int
+	MemtableEntries       int
+	MemtableBytes         int
+	SSTables              int
+	CacheEntries          int
+	CacheBytes            int
+	CacheHits             uint64
+	CacheMisses           uint64
+	BloomRejections       uint64
+	BackgroundCompactions uint64
 }
 
 type mutation struct {

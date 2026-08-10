@@ -168,9 +168,15 @@ tests for any persistent format it introduces.
       staging directory, atomically install without overwriting, and reopen as
       independent SQL databases. The server exposes consensus-aware `/healthz`,
       JSON `/status`, and Prometheus-style `/metrics` endpoints.
-14. **Performance engineering**
-    - Block cache, Bloom filters, sparse table indexes, background maintenance,
-      workload benchmarks, profiles, and regression thresholds.
+14. **Performance engineering (initial mechanisms implemented)**
+    - Per-SSTable Bloom filters reject definite misses before index/disk access;
+      a byte-bounded LRU caches checksummed values and evicts by recency.
+      Threshold-triggered background compaction bounds table amplification while
+      preserving the same foreground locking and crash-safety invariants.
+    - Cache hit/miss/bytes, Bloom rejections, and background compactions are in
+      storage diagnostics and `/metrics`. Repeatable Go benchmarks cover durable
+      writes, cached reads, ordered 1,000-row scans, and indexed SQL point reads;
+      smoke benchmark execution is part of milestone verification.
 15. **Production hardening**
     - Directory locking, configuration validation, TLS/SCRAM, safe upgrades,
       distributed commit recovery, operational tooling, and release checks.
@@ -180,8 +186,14 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 14 introduces measured storage/query performance engineering. The
-PostgreSQL and admin endpoints can be started with:
+Milestone 15 closes production-safety gaps and adds release checks. Benchmarks
+can be reproduced with:
+
+```text
+go test -bench . -benchmem ./storage/lsm ./sql/engine
+```
+
+The PostgreSQL and admin endpoints can be started with:
 
 ```text
 go run ./cmd/pebbledb-server -data ./data -listen 127.0.0.1:5432 -admin 127.0.0.1:8080

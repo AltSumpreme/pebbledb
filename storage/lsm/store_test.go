@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"pebbledb/storage/kv"
 )
@@ -345,6 +346,60 @@ func TestOnlineCheckpointIsIndependentAndNeverOverwrites(t *testing.T) {
 	}
 }
 
+func TestBloomFilterAndBoundedCacheMetrics(t *testing.T) {
+	store, err := Open(t.TempDir(), Options{
+		MemtableSizeBytes: 1, BlockCacheBytes: 256, BloomBitsPerKey: 12,
+		DisableBackgroundCompaction: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put([]byte("present"), []byte("cached-value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.Get([]byte("present")); err != nil || !found {
+		t.Fatalf("first get found=%v err=%v", found, err)
+	}
+	if _, found, err := store.Get([]byte("present")); err != nil || !found {
+		t.Fatalf("second get found=%v err=%v", found, err)
+	}
+	if _, found, err := store.Get([]byte("definitely-absent")); err != nil || found {
+		t.Fatalf("absent get found=%v err=%v", found, err)
+	}
+	stats := store.Stats()
+	if stats.CacheMisses == 0 || stats.CacheHits == 0 || stats.BloomRejections == 0 {
+		t.Fatalf("performance metrics were not exercised: %+v", stats)
+	}
+	if stats.CacheBytes > 256 {
+		t.Fatalf("cache exceeded bound: %+v", stats)
+	}
+}
+
+func TestBackgroundCompactionBoundsTableCount(t *testing.T) {
+	store, err := Open(t.TempDir(), Options{MemtableSizeBytes: 1, CompactionThreshold: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for index := 0; index < 9; index++ {
+		if err := store.Put([]byte(fmt.Sprintf("key/%02d", index)), []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for store.Stats().BackgroundCompactions == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	stats := store.Stats()
+	if stats.BackgroundCompactions == 0 || stats.SSTables >= 9 {
+		t.Fatalf("background compaction did not run: %+v", stats)
+	}
+	for index := 0; index < 9; index++ {
+		assertValue(t, store, fmt.Sprintf("key/%02d", index), "value", true)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	store := openTestStore(t, Options{})
 	var wait sync.WaitGroup
@@ -466,12 +521,19 @@ func openTestStore(t *testing.T, options Options) *Store {
 func simulateCrash(t *testing.T, store *Store) {
 	t.Helper()
 	store.mu.Lock()
-	defer store.mu.Unlock()
+	store.closing = true
+	store.mu.Unlock()
+	close(store.stopMaintenance)
+	store.maintenanceDone.Wait()
+	store.mu.Lock()
 	if err := store.wal.close(); err != nil {
+		store.mu.Unlock()
 		t.Fatalf("close WAL for simulated crash: %v", err)
 	}
 	closeSSTables(store.tables)
 	store.closed = true
+	store.closing = false
+	store.mu.Unlock()
 }
 
 func assertValue(t *testing.T, store *Store, key, expected string, expectedFound bool) {
