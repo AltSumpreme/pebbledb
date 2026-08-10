@@ -26,6 +26,9 @@ ordered LSM store.
   storage-format marker.
 - Durable two-phase commit decision logging and crash recovery primitives for
   multi-range mutation integration.
+- Durable rolling binary-upgrade coordination with per-node compatibility
+  ranges, readiness acknowledgments, monotonic activation, restart recovery,
+  and fail-closed rejection of old binaries.
 - Seeded chaos/recovery coverage, health/status/metrics endpoints, benchmarks,
   race testing, and release verification targets.
 
@@ -74,6 +77,19 @@ go run ./cmd/pebbledb-server \
 
 The admin listener provides `/healthz`, `/status`, and `/metrics`.
 
+## Rolling binary upgrades
+
+Cluster behavior is controlled by a durable active version. The safe sequence
+is: roll every node to a binary supporting both versions, register those binary
+ranges, call `BeginUpgrade`, acknowledge the target from every node, and call
+`FinalizeUpgrade`. Until finalization, behavior remains on the old active
+version and the activation can be aborted. After finalization, a binary that
+does not support the active version is rejected during engine startup.
+
+The engine exposes `RegisterUpgradeNode`, `BeginUpgrade`,
+`AcknowledgeUpgrade`, `FinalizeUpgrade`, and `AbortUpgrade`; current state is in
+the admin status response and `pebbledb_cluster_version_*` metrics.
+
 ## SQL example
 
 ```sql
@@ -107,8 +123,7 @@ executes one iteration of every storage/SQL benchmark. Individual targets are
 
 - The SQL dialect and PostgreSQL catalogs/types are a subset, not drop-in
   PostgreSQL compatibility.
-- Certificate rotation, rolling format migrations, and automated restore
-  orchestration are not implemented.
+- Certificate rotation and automated restore orchestration are not implemented.
 - The durable distributed-commit component is not yet wired into the SQL range
   mutation path, so cross-range SQL writes remain fail-closed.
 - Placement actions expose an orchestration boundary; production-grade node

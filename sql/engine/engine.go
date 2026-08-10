@@ -11,6 +11,7 @@ import (
 	"pebbledb/distributed/query"
 	"pebbledb/distributed/raft"
 	"pebbledb/distributed/ranges"
+	"pebbledb/distributed/upgrade"
 	"pebbledb/sql/ast"
 	"pebbledb/sql/binder"
 	"pebbledb/sql/executor"
@@ -29,6 +30,8 @@ type Engine struct {
 	raftNode   *raft.Node
 	raftGroup  *raft.Group
 	ranges     *ranges.Router
+	upgrade    *upgrade.Coordinator
+	nodeID     string
 	manager    *mvcc.Manager
 	catalog    *catalog.Catalog
 	databaseID catalog.DescriptorID
@@ -42,9 +45,41 @@ type Diagnostics struct {
 	Storage   lsm.Stats
 	Consensus raft.Status
 	Ranges    []ranges.Descriptor
+	Upgrade   upgrade.Status
 }
 
 func Open(directory string) (*Engine, error) {
+	return OpenWithOptions(directory, Options{})
+}
+
+// Options identifies this binary during rolling cluster-version changes.
+// Zero values select the current binary's full compatibility interval.
+type Options struct {
+	NodeID           string
+	MinBinaryVersion upgrade.Version
+	MaxBinaryVersion upgrade.Version
+}
+
+func (options Options) normalized() Options {
+	if options.NodeID == "" {
+		options.NodeID = "node-1"
+	}
+	if options.MinBinaryVersion == 0 {
+		options.MinBinaryVersion = upgrade.MinimumVersion
+	}
+	if options.MaxBinaryVersion == 0 {
+		options.MaxBinaryVersion = upgrade.CurrentVersion
+	}
+	return options
+}
+
+// OpenWithOptions opens an engine and registers its supported cluster-version
+// interval. An old binary is refused after a newer version is activated.
+func OpenWithOptions(directory string, options Options) (*Engine, error) {
+	options = options.normalized()
+	if options.MinBinaryVersion < upgrade.MinimumVersion || options.MaxBinaryVersion > upgrade.CurrentVersion || options.MinBinaryVersion > options.MaxBinaryVersion {
+		return nil, fmt.Errorf("sql engine: invalid binary compatibility interval %d-%d", options.MinBinaryVersion, options.MaxBinaryVersion)
+	}
 	store, err := lsm.Open(directory)
 	if err != nil {
 		return nil, err
@@ -81,6 +116,23 @@ func Open(directory string) (*Engine, error) {
 	if err != nil {
 		return fail(err)
 	}
+	bootstrapVersion := upgrade.BaselineVersion
+	existing, err := manager.Store().Scan(nil, nil)
+	if err != nil {
+		return fail(err)
+	}
+	if len(existing) == 0 {
+		bootstrapVersion = options.MaxBinaryVersion
+	}
+	upgradeCoordinator, err := upgrade.Open(manager.Store(), bootstrapVersion)
+	if err != nil {
+		return fail(err)
+	}
+	if err := upgradeCoordinator.Register(upgrade.Binary{
+		NodeID: options.NodeID, Min: options.MinBinaryVersion, Max: options.MaxBinaryVersion,
+	}); err != nil {
+		return fail(err)
+	}
 	catalogValue, err := catalog.New(manager.Store())
 	if err != nil {
 		return fail(err)
@@ -94,6 +146,8 @@ func Open(directory string) (*Engine, error) {
 		raftNode:   raftNode,
 		raftGroup:  raftGroup,
 		ranges:     rangeRouter,
+		upgrade:    upgradeCoordinator,
+		nodeID:     options.NodeID,
 		manager:    manager,
 		catalog:    catalogValue,
 		databaseID: database.ID,
@@ -370,6 +424,34 @@ func (engine *Engine) Catalog() *catalog.Catalog { return engine.catalog }
 // split orchestration.
 func (engine *Engine) Ranges() *ranges.Router { return engine.ranges }
 
+// UpgradeStatus reports the durable active/target cluster versions and binary
+// readiness of registered nodes.
+func (engine *Engine) UpgradeStatus() upgrade.Status { return engine.upgrade.Status() }
+
+func (engine *Engine) RegisterUpgradeNode(binary upgrade.Binary) error {
+	return engine.upgrade.Register(binary)
+}
+
+func (engine *Engine) RemoveUpgradeNode(nodeID string) error {
+	return engine.upgrade.Remove(nodeID)
+}
+
+func (engine *Engine) BeginUpgrade(target upgrade.Version) error {
+	return engine.upgrade.Begin(target)
+}
+
+func (engine *Engine) AcknowledgeUpgrade(nodeID string, target upgrade.Version) error {
+	return engine.upgrade.Acknowledge(nodeID, target)
+}
+
+func (engine *Engine) FinalizeUpgrade(target upgrade.Version) error {
+	return engine.upgrade.Finalize(target)
+}
+
+func (engine *Engine) AbortUpgrade(target upgrade.Version) error {
+	return engine.upgrade.Abort(target)
+}
+
 // ConsensusStatus reports the local member of the default range's Raft group.
 func (engine *Engine) ConsensusStatus() raft.Status { return engine.raftNode.Status() }
 
@@ -378,7 +460,7 @@ func (engine *Engine) ConsensusStatus() raft.Status { return engine.raftNode.Sta
 func (engine *Engine) Diagnostics() Diagnostics {
 	return Diagnostics{
 		Storage: engine.store.Stats(), Consensus: engine.raftNode.Status(),
-		Ranges: engine.ranges.Descriptors(),
+		Ranges: engine.ranges.Descriptors(), Upgrade: engine.upgrade.Status(),
 	}
 }
 

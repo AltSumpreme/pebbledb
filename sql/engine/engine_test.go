@@ -1,13 +1,75 @@
 package engine_test
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"pebbledb/distributed/raft"
+	"pebbledb/distributed/upgrade"
 	"pebbledb/sql/engine"
 )
+
+func TestRollingClusterVersionActivationRejectsOldBinary(t *testing.T) {
+	directory := t.TempDir()
+	database, err := engine.OpenWithOptions(directory, engine.Options{
+		NodeID: "node-a", MinBinaryVersion: upgrade.BaselineVersion, MaxBinaryVersion: upgrade.BaselineVersion,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := database.UpgradeStatus(); status.Active != upgrade.BaselineVersion || len(status.Nodes) != 1 {
+		t.Fatalf("bootstrap status = %+v", status)
+	}
+	old := func(nodeID string) upgrade.Binary {
+		return upgrade.Binary{NodeID: nodeID, Min: upgrade.BaselineVersion, Max: upgrade.BaselineVersion}
+	}
+	rolled := func(nodeID string) upgrade.Binary {
+		return upgrade.Binary{NodeID: nodeID, Min: upgrade.BaselineVersion, Max: upgrade.CurrentVersion}
+	}
+	if err := database.RegisterUpgradeNode(old("node-b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterUpgradeNode(rolled("node-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RegisterUpgradeNode(rolled("node-b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.BeginUpgrade(upgrade.CurrentVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AcknowledgeUpgrade("node-a", upgrade.CurrentVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AcknowledgeUpgrade("node-b", upgrade.CurrentVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.FinalizeUpgrade(upgrade.CurrentVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if oldDatabase, err := engine.OpenWithOptions(directory, engine.Options{
+		NodeID: "node-a", MinBinaryVersion: upgrade.BaselineVersion, MaxBinaryVersion: upgrade.BaselineVersion,
+	}); !errors.Is(err, upgrade.ErrIncompatible) {
+		if oldDatabase != nil {
+			_ = oldDatabase.Close()
+		}
+		t.Fatalf("old binary reopen error = %v, want incompatibility", err)
+	}
+	reopened, err := engine.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if status := reopened.UpgradeStatus(); status.Active != upgrade.CurrentVersion || status.Target != 0 {
+		t.Fatalf("reopened status = %+v", status)
+	}
+}
 
 func TestOnlineCheckpointRestoresCommittedSQLState(t *testing.T) {
 	root := t.TempDir()

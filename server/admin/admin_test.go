@@ -20,7 +20,7 @@ func TestHealthStatusAndMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, content := range map[string]string{
-		"/healthz": "ok", "/status": `"Consensus"`, "/metrics": "pebbledb_raft_commit_index",
+		"/healthz": "ok", "/status": `"Upgrade"`, "/metrics": "pebbledb_cluster_version_active",
 	} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()

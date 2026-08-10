@@ -41,6 +41,9 @@ func Handler(database *engine.Engine) (http.Handler, error) {
 		_, _ = fmt.Fprintf(writer, "pebbledb_raft_term %d\n", diagnostics.Consensus.Term)
 		_, _ = fmt.Fprintf(writer, "pebbledb_raft_commit_index %d\n", diagnostics.Consensus.CommitIndex)
 		_, _ = fmt.Fprintf(writer, "pebbledb_ranges %d\n", len(diagnostics.Ranges))
+		_, _ = fmt.Fprintf(writer, "pebbledb_cluster_version_active %d\n", diagnostics.Upgrade.Active)
+		_, _ = fmt.Fprintf(writer, "pebbledb_cluster_version_target %d\n", diagnostics.Upgrade.Target)
+		_, _ = fmt.Fprintf(writer, "pebbledb_cluster_upgrade_nodes %d\n", len(diagnostics.Upgrade.Nodes))
 	})
 	return mux, nil
 }

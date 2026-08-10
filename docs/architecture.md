@@ -194,12 +194,19 @@ tests for any persistent format it introduces.
       ABORT states. Idempotent range participants stage mutation intents, and
       restart recovery rolls durable commits forward or incomplete prepares
       back. Decision transitions never permit a committed transaction to abort.
+    - A checksummed cluster-version record coordinates rolling binary upgrades.
+      Nodes publish supported version intervals before a consecutive target can
+      begin, acknowledge readiness independently, and atomically activate only
+      after every node is ready. Active versions are monotonic, pending changes
+      can be aborted safely, state survives restart, and incompatible old
+      binaries fail engine startup. Version state is included in admin status
+      and metrics.
     - `make verify` builds all packages, runs unit/integration and race suites,
       runs `go vet`, and smokes every storage/SQL benchmark. The existing CI
       continues to enforce its build and unit-test checks.
-    - Certificate rotation, rolling format migrations, automated restore, and
-      SQL/range/Raft integration of distributed commits remain production
-      hardening work; the repository must not yet be treated as production-ready.
+    - Certificate rotation, automated restore, and SQL/range/Raft integration
+      of distributed commits remain production hardening work; the repository
+      must not yet be treated as production-ready.
 
 PostgreSQL wire support is intentionally late in the dependency chain but can be
 developed earlier as an adapter once stable session and result interfaces exist.
