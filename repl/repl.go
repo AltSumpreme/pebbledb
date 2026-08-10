@@ -3,23 +3,31 @@ package repl
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
-	"pebbledb/db"
-	"pebbledb/executor"
+	"pebbledb"
 	"pebbledb/parser"
 	"strings"
 )
 
-func ReplInit(database *db.Database) {
+func ReplInit(engine *pebbledb.Engine) {
 
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("Welcome to PebbleDB ! Type 'Exit' to quit.")
 
 	for {
 		fmt.Print("> ")
-		input, _ := reader.ReadString('\n')
+		input, err := reader.ReadString('\n')
+		if err != nil && !errorsIsEOF(err) {
+			fmt.Printf("Error reading command: %s\n", err)
+			continue
+		}
 		input = strings.TrimSpace(input)
 		if input == "" {
+			if errorsIsEOF(err) {
+				fmt.Println("Exiting PebbleDB. Goodbye!")
+				break
+			}
 			fmt.Println("Please enter a command.")
 			continue
 		}
@@ -38,7 +46,7 @@ func ReplInit(database *db.Database) {
 			continue
 		}
 
-		result := executor.ExecuteCommand(cmd, database)
+		result := engine.Execute(cmd)
 		if result.Error != nil {
 			fmt.Printf("Error executing command: %s\n", result.Error)
 			continue
@@ -54,6 +62,13 @@ func ReplInit(database *db.Database) {
 			continue
 		}
 		fmt.Println("Command executed successfully.")
+		if errorsIsEOF(err) {
+			break
+		}
 	}
 
+}
+
+func errorsIsEOF(err error) bool {
+	return err == io.EOF
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"pebbledb/db"
 )
 
@@ -114,22 +115,32 @@ func SerializeRow(row db.Row, columns []db.Column) ([]byte, error) {
 		val := row[col.Name]
 		switch col.Type {
 		case db.TypeInt:
-			if v, ok := val.(int); ok {
-				if err := binary.Write(&buf, binary.LittleEndian, int32(v)); err != nil {
-					return nil, err
-				}
-
+			v, ok := val.(int)
+			if !ok {
+				return nil, fmt.Errorf("column %s expected INT, got %T", col.Name, val)
+			}
+			if v < math.MinInt32 || v > math.MaxInt32 {
+				return nil, fmt.Errorf("column %s value %d is outside INT storage range", col.Name, v)
+			}
+			if err := binary.Write(&buf, binary.LittleEndian, int32(v)); err != nil {
+				return nil, err
 			}
 		case db.TypeString:
-			if str, ok := val.(string); ok {
-				if err := binary.Write(&buf, binary.LittleEndian, uint16(len(str))); err != nil {
-					return nil, err
-				}
-				if _, err := buf.Write([]byte(str)); err != nil {
-					return nil, err
-				}
+			str, ok := val.(string)
+			if !ok {
+				return nil, fmt.Errorf("column %s expected STRING, got %T", col.Name, val)
 			}
-
+			if len(str) > math.MaxUint16 {
+				return nil, fmt.Errorf("column %s string is too long", col.Name)
+			}
+			if err := binary.Write(&buf, binary.LittleEndian, uint16(len(str))); err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write([]byte(str)); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("unsupported column type %s for column %s", col.Type, col.Name)
 		}
 	}
 	return buf.Bytes(), nil
@@ -159,7 +170,6 @@ func DeserializeRow(data []byte, columns []db.Column) (db.Row, error) {
 			row[col.Name] = string(strData)
 		}
 	}
-	fmt.Printf("%v\n", row)
 	return row, nil
 }
 

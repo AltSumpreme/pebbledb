@@ -1,9 +1,6 @@
 package db
 
-import (
-	"fmt"
-	"strings"
-)
+import "fmt"
 
 type Database struct {
 	Tables map[string]*Table
@@ -16,8 +13,20 @@ func NewDatabase() *Database {
 }
 
 func (db *Database) CreateTable(name string, columns []Column) error {
+	name = NormalizeIdentifier(name)
 	if _, exists := db.Tables[name]; exists {
 		return fmt.Errorf("table %s already exists", name)
+	}
+	seenColumns := make(map[string]struct{}, len(columns))
+	for i := range columns {
+		columns[i].Name = NormalizeIdentifier(columns[i].Name)
+		if columns[i].Name == "" {
+			return fmt.Errorf("column name cannot be empty")
+		}
+		if _, exists := seenColumns[columns[i].Name]; exists {
+			return fmt.Errorf("column %s already exists", columns[i].Name)
+		}
+		seenColumns[columns[i].Name] = struct{}{}
 	}
 	table := NewTable(name, columns)
 	db.Tables[name] = table
@@ -26,6 +35,7 @@ func (db *Database) CreateTable(name string, columns []Column) error {
 }
 
 func (db *Database) GetTable(name string) (*Table, error) {
+	name = NormalizeIdentifier(name)
 	if table, exists := db.Tables[name]; exists {
 		return table, nil
 	} else {
@@ -42,6 +52,7 @@ func (db *Database) GetAllTables() []*Table {
 }
 
 func (db *Database) DropTable(name string) error {
+	name = NormalizeIdentifier(name)
 	if _, exists := db.Tables[name]; exists {
 		delete(db.Tables, name)
 		return nil
@@ -50,15 +61,25 @@ func (db *Database) DropTable(name string) error {
 }
 
 func (db *Database) InsertValue(tablename string, values []string) error {
+	tablename = NormalizeIdentifier(tablename)
 	table, exists := db.Tables[tablename]
 	if exists {
-		table.Insert(values)
-		return nil
+		return table.Insert(values)
 	}
 	return fmt.Errorf("table %s does not exist", tablename)
 }
 
+func (db *Database) InsertColumns(tablename string, columns []Column, values []string) error {
+	tablename = NormalizeIdentifier(tablename)
+	table, exists := db.Tables[tablename]
+	if !exists {
+		return fmt.Errorf("table %s does not exist", tablename)
+	}
+	return table.InsertColumns(columns, values)
+}
+
 func (db *Database) SelectAll(tableName string) ([]Row, error) {
+	tableName = NormalizeIdentifier(tableName)
 	table, exists := db.Tables[tableName]
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
@@ -67,7 +88,7 @@ func (db *Database) SelectAll(tableName string) ([]Row, error) {
 }
 
 func (db *Database) SelectColumns(tableName string, columns []Column) ([]Row, error) {
-	tableName = strings.ToUpper(strings.TrimSpace(tableName))
+	tableName = NormalizeIdentifier(tableName)
 	table, exists := db.Tables[tableName]
 	if !exists {
 		return nil, fmt.Errorf("table %s does not exist", tableName)
@@ -76,10 +97,11 @@ func (db *Database) SelectColumns(tableName string, columns []Column) ([]Row, er
 	for _, row := range table.Rows {
 		selectedRow := Row{}
 		for _, col := range columns {
-			if value, ok := row[col.Name]; ok {
-				selectedRow[col.Name] = value
+			name := NormalizeIdentifier(col.Name)
+			if value, ok := row[name]; ok {
+				selectedRow[name] = value
 			} else {
-				return nil, fmt.Errorf("column %s does not exist in table %s", col.Name, tableName)
+				return nil, fmt.Errorf("column %s does not exist in table %s", name, tableName)
 			}
 		}
 		result = append(result, selectedRow)

@@ -8,8 +8,8 @@ import (
 	"pebbledb/db"
 )
 
-func LoadSchemaFromDisk(tableName string) ([]db.Column, error) {
-	metafile := filepath.Join(DBDir, tableName+".meta.json")
+func LoadSchemaFromDisk(dataDir, tableName string) ([]db.Column, error) {
+	metafile := filepath.Join(dataDir, tableName+".meta.json")
 	if _, err := os.Stat(metafile); os.IsNotExist(err) {
 		return nil, fmt.Errorf("schema file for table %s does not exist", tableName)
 	}
@@ -22,6 +22,9 @@ func LoadSchemaFromDisk(tableName string) ([]db.Column, error) {
 	var columnDef []db.Column
 	if err := json.NewDecoder(file).Decode(&columnDef); err != nil {
 		return nil, fmt.Errorf("failed to decode schema for table %s: %w", tableName, err)
+	}
+	for i := range columnDef {
+		columnDef[i].Name = db.NormalizeIdentifier(columnDef[i].Name)
 	}
 	return columnDef, nil
 }

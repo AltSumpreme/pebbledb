@@ -2,7 +2,6 @@ package tests
 
 import (
 	"fmt"
-	"os"
 	"pebbledb/db"
 	"pebbledb/storage"
 	"strconv"
@@ -10,8 +9,7 @@ import (
 )
 
 func TestWriteAndReadMultiPage(t *testing.T) {
-	_ = os.RemoveAll(storage.DBDir)
-	_ = os.MkdirAll(storage.DBDir, 0775)
+	dataDir := t.TempDir()
 
 	// Initialize and create the table
 	database := db.NewDatabase()
@@ -35,12 +33,12 @@ func TestWriteAndReadMultiPage(t *testing.T) {
 	}
 
 	// Save database to disk
-	if err := storage.SaveToDisk(database); err != nil {
+	if err := storage.SaveToDisk(database, dataDir); err != nil {
 		t.Fatalf("Failed to save to disk: %v", err)
 	}
 
 	// Load the database from disk
-	loadedDB, err := storage.LoadFromDisk()
+	loadedDB, err := storage.LoadFromDisk(dataDir)
 	if err != nil {
 		t.Fatalf("Failed to load from disk: %v", err)
 	}

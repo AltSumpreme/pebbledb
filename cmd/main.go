@@ -13,5 +13,5 @@ func main() {
 		log.Fatal("Failed to initialize PebbleDB engine:", err)
 	}
 
-	repl.ReplInit(engine.DB)
+	repl.ReplInit(engine)
 }
