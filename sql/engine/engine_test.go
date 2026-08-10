@@ -7,9 +7,80 @@ import (
 	"testing"
 
 	"pebbledb/distributed/raft"
+	"pebbledb/distributed/ranges"
 	"pebbledb/distributed/upgrade"
 	"pebbledb/sql/engine"
+	"pebbledb/storage/fault"
+	"pebbledb/storage/lsm"
 )
+
+func TestCrossRangeSQLCommitAndRestart(t *testing.T) {
+	root := t.TempDir()
+	mainDirectory, rightDirectory := filepath.Join(root, "main"), filepath.Join(root, "right")
+	rightStore, err := lsm.Open(rightDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightEndpoint, err := fault.New(rightStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := engine.Open(mainDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance INT NOT NULL)"); err != nil {
+		t.Fatal(err)
+	}
+	spans, err := database.DistributedSpans("SELECT balance FROM accounts WHERE id = 2")
+	if err != nil || len(spans) != 1 || len(spans[0].Start) == 0 {
+		t.Fatalf("derive split boundary: spans=%+v err=%v", spans, err)
+	}
+	if _, _, err := database.Ranges().Split(spans[0].Start, 2, ranges.Replica{ID: 2, Store: rightEndpoint}); err != nil {
+		t.Fatalf("split SQL range: %v", err)
+	}
+	rightEndpoint.FailAfter(fault.Apply, 0, nil)
+	if _, err := database.Execute("INSERT INTO accounts VALUES (1, 100), (2, 200)"); !errors.Is(err, fault.ErrInjected) {
+		t.Fatalf("cross-range prepare failure = %v, want injected error", err)
+	}
+	rolledBack, err := database.Execute("SELECT COUNT(*) FROM accounts")
+	if err != nil || rolledBack[0].Rows[0][0].String() != "0" {
+		t.Fatalf("failed cross-range SQL commit leaked rows: %+v err=%v", rolledBack, err)
+	}
+	results, err := database.Execute(`
+		INSERT INTO accounts VALUES (1, 100), (2, 200);
+		SELECT id, balance FROM accounts ORDER BY id;
+	`)
+	if err != nil {
+		t.Fatalf("cross-range SQL commit: %v", err)
+	}
+	if results[0].RowsAffected != 2 || len(results[1].Rows) != 2 || results[1].Rows[1][1].String() != "200" {
+		t.Fatalf("cross-range results = %+v", results)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rightStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rightStore, err = lsm.Open(rightDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rightStore.Close()
+	database, err = engine.OpenWithOptions(mainDirectory, engine.Options{
+		AdditionalReplicas: []ranges.Replica{{ID: 2, Store: rightStore}},
+	})
+	if err != nil {
+		t.Fatalf("reopen distributed SQL engine: %v", err)
+	}
+	defer database.Close()
+	results, err = database.Execute("SELECT id, balance FROM accounts ORDER BY id")
+	if err != nil || len(results[0].Rows) != 2 || results[0].Rows[0][1].String() != "100" || results[0].Rows[1][1].String() != "200" {
+		t.Fatalf("restarted cross-range rows=%+v err=%v", results, err)
+	}
+}
 
 func TestRollingClusterVersionActivationRejectsOldBinary(t *testing.T) {
 	directory := t.TempDir()

@@ -5,7 +5,10 @@ package ranges
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -13,14 +16,19 @@ import (
 	"sync"
 
 	"pebbledb/codec"
+	"pebbledb/distributed/raft"
+	"pebbledb/distributed/txn"
 	"pebbledb/storage/kv"
 )
 
 var (
 	ErrNoRange         = errors.New("ranges: no range contains key")
 	ErrStaleDescriptor = errors.New("ranges: stale range descriptor")
+	// ErrCrossRangeBatch is retained for source compatibility. Apply now uses
+	// recoverable two-phase commit for batches spanning replica endpoints.
 	ErrCrossRangeBatch = errors.New("ranges: atomic batch crosses range boundaries")
 	ErrInvalidSplit    = errors.New("ranges: invalid split key")
+	ErrReservedKey     = errors.New("ranges: key belongs to internal protocol state")
 )
 
 const descriptorVersion byte = 1
@@ -44,17 +52,27 @@ type Replica struct {
 
 // Router implements kv.BatchStore over a sorted, gap-free range map.
 type Router struct {
-	mu          sync.RWMutex
-	metadata    kv.BatchStore
-	replicas    map[uint64]kv.BatchStore
-	descriptors []Descriptor
+	mu            sync.RWMutex
+	transactionMu sync.Mutex
+	metadata      kv.BatchStore
+	replicas      map[uint64]kv.BatchStore
+	descriptors   []Descriptor
+	coordinator   *txn.Coordinator
+	participants  map[string]*txn.Participant
+	needsRecovery bool
 }
 
 // Open loads routing metadata or bootstraps one full-keyspace range on initial.
 // Every replica referenced by existing metadata must be supplied.
 func Open(metadata kv.BatchStore, initial Replica, additional ...Replica) (*Router, error) {
-	if metadata == nil {
-		return nil, fmt.Errorf("ranges: metadata store cannot be nil")
+	return OpenWithTransactionStore(metadata, metadata, initial, additional...)
+}
+
+// OpenWithTransactionStore places 2PC decisions on a dedicated replicated
+// system store while range descriptors remain on their metadata store.
+func OpenWithTransactionStore(metadata, transactionStore kv.BatchStore, initial Replica, additional ...Replica) (*Router, error) {
+	if metadata == nil || transactionStore == nil {
+		return nil, fmt.Errorf("ranges: metadata and transaction stores cannot be nil")
 	}
 	replicas := make(map[uint64]kv.BatchStore, 1+len(additional))
 	for _, replica := range append([]Replica{initial}, additional...) {
@@ -66,7 +84,7 @@ func Open(metadata kv.BatchStore, initial Replica, additional ...Replica) (*Rout
 		}
 		replicas[replica.ID] = replica.Store
 	}
-	router := &Router{metadata: metadata, replicas: replicas}
+	router := &Router{metadata: metadata, replicas: replicas, participants: make(map[string]*txn.Participant)}
 	entries, err := metadata.Scan(descriptorKeyPrefix, codec.PrefixEnd(descriptorKeyPrefix))
 	if err != nil {
 		return nil, fmt.Errorf("ranges: load descriptors: %w", err)
@@ -95,6 +113,19 @@ func Open(metadata kv.BatchStore, initial Replica, additional ...Replica) (*Rout
 	if err := router.validateAndSort(); err != nil {
 		return nil, err
 	}
+	coordinator, err := txn.NewCoordinator(transactionStore)
+	if err != nil {
+		return nil, err
+	}
+	router.coordinator = coordinator
+	for replicaID, store := range replicas {
+		if err := router.addParticipant(replicaID, store); err != nil {
+			return nil, err
+		}
+	}
+	if err := router.recoverTransactions(context.Background()); err != nil {
+		return nil, fmt.Errorf("ranges: recover distributed transactions: %w", err)
+	}
 	return router, nil
 }
 
@@ -121,6 +152,14 @@ func (router *Router) Route(key []byte) (Descriptor, error) {
 }
 
 func (router *Router) Get(key []byte) ([]byte, bool, error) {
+	if internalKey(key) {
+		return nil, false, ErrReservedKey
+	}
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
+		return nil, false, err
+	}
 	router.mu.RLock()
 	defer router.mu.RUnlock()
 	descriptor, err := router.routeLocked(key)
@@ -138,33 +177,77 @@ func (router *Router) Delete(key []byte) error {
 	return router.Apply([]kv.Mutation{{Key: key, Delete: true}})
 }
 
-// Apply routes an atomic batch. A batch spanning ranges is rejected until the
-// distributed transaction coordinator is introduced.
+// Apply routes an atomic batch. Multi-replica batches use recoverable 2PC; the
+// transaction mutex prevents reads or topology changes from observing a
+// partially acknowledged commit.
 func (router *Router) Apply(mutations []kv.Mutation) error {
 	if len(mutations) == 0 {
 		return nil
 	}
-	router.mu.RLock()
-	defer router.mu.RUnlock()
-	descriptor, err := router.routeLocked(mutations[0].Key)
-	if err != nil {
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
 		return err
 	}
-	for _, mutation := range mutations[1:] {
-		current, err := router.routeLocked(mutation.Key)
+	router.mu.RLock()
+	defer router.mu.RUnlock()
+	grouped := make(map[uint64][]kv.Mutation)
+	for _, mutation := range mutations {
+		if internalKey(mutation.Key) {
+			return ErrReservedKey
+		}
+		descriptor, err := router.routeLocked(mutation.Key)
 		if err != nil {
 			return err
 		}
-		if current.ID != descriptor.ID {
-			return ErrCrossRangeBatch
+		grouped[descriptor.ReplicaID] = append(grouped[descriptor.ReplicaID], mutation)
+	}
+	if len(grouped) == 1 {
+		for replicaID, batch := range grouped {
+			return router.replicas[replicaID].Apply(batch)
 		}
 	}
-	return router.replicas[descriptor.ReplicaID].Apply(mutations)
+	replicaIDs := make([]uint64, 0, len(grouped))
+	for replicaID := range grouped {
+		replicaIDs = append(replicaIDs, replicaID)
+	}
+	sort.Slice(replicaIDs, func(left, right int) bool { return replicaIDs[left] < replicaIDs[right] })
+	batches := make([]txn.Batch, 0, len(replicaIDs))
+	for _, replicaID := range replicaIDs {
+		participant := router.participants[participantID(replicaID)]
+		if participant == nil {
+			return fmt.Errorf("ranges: transaction participant for replica %d is unavailable", replicaID)
+		}
+		batches = append(batches, txn.Batch{Participant: participant, Mutations: grouped[replicaID]})
+	}
+	transactionID, err := newTransactionID()
+	if err != nil {
+		return err
+	}
+	err = router.coordinator.Commit(context.Background(), transactionID, batches)
+	if !errors.Is(err, txn.ErrInDoubt) {
+		return err
+	}
+	router.needsRecovery = true
+	outcome, recoveryErr := router.coordinator.Resolve(context.Background(), transactionID, router.participants)
+	if recoveryErr != nil {
+		return errors.Join(err, recoveryErr)
+	}
+	router.needsRecovery = false
+	if outcome == txn.Committed {
+		return nil
+	}
+	return err
 }
 
 // ApplyToRange processes a range-addressed request and rejects stale routing
 // metadata. This is the request boundary used by later network transports.
 func (router *Router) ApplyToRange(rangeID, generation uint64, mutations []kv.Mutation) error {
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
+		return err
+	}
 	router.mu.RLock()
 	defer router.mu.RUnlock()
 	descriptor := router.byIDLocked(rangeID)
@@ -172,6 +255,9 @@ func (router *Router) ApplyToRange(rangeID, generation uint64, mutations []kv.Mu
 		return ErrStaleDescriptor
 	}
 	for _, mutation := range mutations {
+		if internalKey(mutation.Key) {
+			return ErrReservedKey
+		}
 		if !contains(*descriptor, mutation.Key) {
 			return ErrStaleDescriptor
 		}
@@ -183,6 +269,11 @@ func (router *Router) ApplyToRange(rangeID, generation uint64, mutations []kv.Mu
 func (router *Router) Scan(start, end []byte) ([]kv.Entry, error) {
 	if len(end) > 0 && bytes.Compare(start, end) > 0 {
 		return nil, fmt.Errorf("ranges: range start must not sort after range end")
+	}
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
+		return nil, err
 	}
 	router.mu.RLock()
 	defer router.mu.RUnlock()
@@ -197,7 +288,7 @@ func (router *Router) Scan(start, end []byte) ([]kv.Entry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("ranges: scan range %d: %w", descriptor.ID, err)
 		}
-		result = append(result, entries...)
+		result = append(result, userEntries(entries)...)
 	}
 	return result, nil
 }
@@ -206,6 +297,11 @@ func (router *Router) Scan(start, end []byte) ([]kv.Entry, error) {
 // descriptors, then removes the now-unrouted source copies. Publishing after
 // copying makes interruption safe; duplicate source data is never routed.
 func (router *Router) Split(splitKey []byte, rightRangeID uint64, right Replica) (Descriptor, Descriptor, error) {
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
+		return Descriptor{}, Descriptor{}, err
+	}
 	router.mu.Lock()
 	defer router.mu.Unlock()
 	if len(splitKey) == 0 || rightRangeID == 0 || right.ID == 0 || right.Store == nil {
@@ -225,7 +321,7 @@ func (router *Router) Split(splitKey []byte, rightRangeID uint64, right Replica)
 	}
 	if entries, err := right.Store.Scan(splitKey, left.End); err != nil {
 		return Descriptor{}, Descriptor{}, err
-	} else if len(entries) != 0 {
+	} else if len(userEntries(entries)) != 0 {
 		return Descriptor{}, Descriptor{}, fmt.Errorf("ranges: split destination is not empty")
 	}
 
@@ -255,6 +351,9 @@ func (router *Router) Split(splitKey []byte, rightRangeID uint64, right Replica)
 		return Descriptor{}, Descriptor{}, fmt.Errorf("ranges: publish split: %w", err)
 	}
 	router.replicas[right.ID] = right.Store
+	if err := router.addParticipant(right.ID, right.Store); err != nil {
+		return Descriptor{}, Descriptor{}, err
+	}
 	*left = updatedLeft
 	router.descriptors = append(router.descriptors, rightDescriptor)
 	sort.Slice(router.descriptors, func(i, j int) bool {
@@ -269,6 +368,11 @@ func (router *Router) Split(splitKey []byte, rightRangeID uint64, right Replica)
 // Move copies a range to another replica before atomically publishing the new
 // placement. The old copy is removed only after routing changes.
 func (router *Router) Move(rangeID uint64, target Replica) (Descriptor, error) {
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
+		return Descriptor{}, err
+	}
 	router.mu.Lock()
 	defer router.mu.Unlock()
 	if target.ID == 0 || target.Store == nil {
@@ -305,6 +409,9 @@ func (router *Router) Move(rangeID uint64, target Replica) (Descriptor, error) {
 		return Descriptor{}, fmt.Errorf("ranges: publish move: %w", err)
 	}
 	router.replicas[target.ID] = target.Store
+	if err := router.addParticipant(target.ID, target.Store); err != nil {
+		return Descriptor{}, err
+	}
 	*descriptor = updated
 	if err := applyEntries(source, entries, true); err != nil {
 		return cloneDescriptor(updated), fmt.Errorf("ranges: move published but source cleanup failed: %w", err)
@@ -316,6 +423,11 @@ func (router *Router) Move(rangeID uint64, target Replica) (Descriptor, error) {
 // placements differ, then one descriptor is atomically published and the other
 // removed.
 func (router *Router) Merge(leftRangeID, rightRangeID uint64) (Descriptor, error) {
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	if err := router.recoverIfNeeded(context.Background()); err != nil {
+		return Descriptor{}, err
+	}
 	router.mu.Lock()
 	defer router.mu.Unlock()
 	left, right := router.byIDLocked(leftRangeID), router.byIDLocked(rightRangeID)
@@ -360,6 +472,54 @@ func (router *Router) Merge(leftRangeID, rightRangeID uint64) (Descriptor, error
 		}
 	}
 	return cloneDescriptor(updated), nil
+}
+
+// Recover resolves any durable distributed decisions before normal traffic.
+// Open invokes it automatically; operators may call it after restoring an
+// unavailable participant.
+func (router *Router) Recover(ctx context.Context) error {
+	router.transactionMu.Lock()
+	defer router.transactionMu.Unlock()
+	return router.recoverTransactions(ctx)
+}
+
+func (router *Router) recoverIfNeeded(ctx context.Context) error {
+	if !router.needsRecovery {
+		return nil
+	}
+	return router.recoverTransactions(ctx)
+}
+
+func (router *Router) recoverTransactions(ctx context.Context) error {
+	router.needsRecovery = true
+	if err := router.coordinator.Recover(ctx, router.participants); err != nil {
+		return fmt.Errorf("ranges: distributed transaction recovery: %w", err)
+	}
+	router.needsRecovery = false
+	return nil
+}
+
+func (router *Router) addParticipant(replicaID uint64, store kv.BatchStore) error {
+	id := participantID(replicaID)
+	if _, exists := router.participants[id]; exists {
+		return nil
+	}
+	participant, err := txn.NewParticipant(id, store)
+	if err != nil {
+		return err
+	}
+	router.participants[id] = participant
+	return nil
+}
+
+func participantID(replicaID uint64) string { return fmt.Sprintf("replica-%020d", replicaID) }
+
+func newTransactionID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("ranges: generate distributed transaction ID: %w", err)
+	}
+	return hex.EncodeToString(random[:]), nil
 }
 
 func (router *Router) validateAndSort() error {
@@ -472,11 +632,19 @@ func applyEntries(store kv.BatchStore, entries []kv.Entry, deleteEntries bool) e
 func userEntries(entries []kv.Entry) []kv.Entry {
 	result := entries[:0]
 	for _, entry := range entries {
-		if !bytes.HasPrefix(entry.Key, descriptorKeyPrefix) {
+		if !internalKey(entry.Key) {
 			result = append(result, entry)
 		}
 	}
 	return result
+}
+
+func internalKey(key []byte) bool {
+	raftStart, _ := raft.JournalKeySpan()
+	decisionStart, _ := txn.DecisionKeySpan()
+	intentStart, _ := txn.IntentKeySpan()
+	return bytes.HasPrefix(key, descriptorKeyPrefix) || bytes.HasPrefix(key, raftStart) ||
+		bytes.HasPrefix(key, decisionStart) || bytes.HasPrefix(key, intentStart)
 }
 
 func descriptorKey(id uint64) []byte {

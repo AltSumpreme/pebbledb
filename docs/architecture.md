@@ -116,9 +116,10 @@ tests for any persistent format it introduces.
      `BEGIN`, `COMMIT`, and `ROLLBACK` provide multi-statement transactions with
      read-your-writes behavior and aborted-transaction handling.
 8. **Ranges and routing (implemented)**
-   - Checksummed persistent descriptors provide a gap-free byte-key range map,
-     generation-checked range requests, ordered multi-range scans, and explicit
-     rejection of cross-range atomic batches pending distributed coordination.
+    - Checksummed persistent descriptors provide a gap-free byte-key range map,
+      generation-checked range requests, ordered multi-range scans, and atomic
+      single-replica batches. Multi-replica batches are grouped deterministically
+      and committed through the recoverable transaction coordinator.
    - Splits copy the future right-hand span before atomically publishing both
      descriptors, then clean obsolete source copies. A multi-LSM harness covers
      boundary routing, data movement, stale clients, restart, and corruption.
@@ -137,8 +138,12 @@ tests for any persistent format it introduces.
       admission limits, cancellation, missing-node handling, and retry-before-
       emit semantics. Streaming map/filter/project stages, equality hash joins,
       and typed global `COUNT`/`SUM` aggregation compose over those exchanges.
-    - Cross-range mutations remain fail-closed while the durable commit
-      coordinator is integrated with range-local MVCC and Raft application.
+    - Cross-range SQL mutations retain MVCC's single serializable validation and
+      commit timestamp, then use a replicated system-range decision and
+      Raft-staged participant intents. The routing transaction gate prevents
+      local reads and range split/move/merge operations from crossing unresolved
+      decisions. Startup recovery completes durable commits or aborts incomplete
+      prepares before MVCC/catalog initialization.
 11. **Automatic placement (implemented)**
     - A continuously runnable controller consumes node capacity/liveness and
       range size/QPS heartbeats, maintains EWMA hot-range signals, and produces
@@ -194,6 +199,10 @@ tests for any persistent format it introduces.
       ABORT states. Idempotent range participants stage mutation intents, and
       restart recovery rolls durable commits forward or incomplete prepares
       back. Decision transitions never permit a committed transaction to abort.
+      The coordinator is wired below MVCC in the range router; its decision and
+      intent spans are included in Raft application snapshots without admitting
+      node-local Raft journal keys. SQL failure/retry and restart tests exercise
+      cross-range inserts end-to-end.
     - A checksummed cluster-version record coordinates rolling binary upgrades.
       Nodes publish supported version intervals before a consecutive target can
       begin, acknowledge readiness independently, and atomically activate only
@@ -204,9 +213,9 @@ tests for any persistent format it introduces.
     - `make verify` builds all packages, runs unit/integration and race suites,
       runs `go vet`, and smokes every storage/SQL benchmark. The existing CI
       continues to enforce its build and unit-test checks.
-    - Certificate rotation, automated restore, and SQL/range/Raft integration
-      of distributed commits remain production hardening work; the repository
-      must not yet be treated as production-ready.
+    - Certificate rotation, automated restore, remote transport, and automated
+      replica discovery remain production hardening work; the repository must
+      not yet be treated as production-ready.
 
 PostgreSQL wire support is intentionally late in the dependency chain but can be
 developed earlier as an adapter once stable session and result interfaces exist.
@@ -240,6 +249,7 @@ optimized SQL scan -> range span derivation -> admitted remote processors
                    -> bounded exchanges -> join/aggregate -> result stream
 ```
 
-Cross-range SQL commits remain deliberately disabled until the new durable
-transaction coordinator is connected to range-local MVCC intents and replicated
-Raft application. No partial cross-range SQL commit is allowed in the meantime.
+Cross-range SQL commits now flow from one MVCC validation into deterministic
+replica batches, a replicated commit decision, and recoverable range-local Raft
+application. External range endpoints must still be provisioned and supplied by
+the embedding process until remote discovery and transport are implemented.

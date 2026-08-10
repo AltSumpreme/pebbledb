@@ -11,6 +11,7 @@ import (
 	"pebbledb/distributed/query"
 	"pebbledb/distributed/raft"
 	"pebbledb/distributed/ranges"
+	"pebbledb/distributed/txn"
 	"pebbledb/distributed/upgrade"
 	"pebbledb/sql/ast"
 	"pebbledb/sql/binder"
@@ -58,6 +59,9 @@ type Options struct {
 	NodeID           string
 	MinBinaryVersion upgrade.Version
 	MaxBinaryVersion upgrade.Version
+	// AdditionalReplicas supplies externally managed range endpoints required by
+	// durable descriptors after a split or move.
+	AdditionalReplicas []ranges.Replica
 }
 
 func (options Options) normalized() Options {
@@ -89,7 +93,13 @@ func OpenWithOptions(directory string, options Options) (*Engine, error) {
 		return nil, err
 	}
 	spanStart, spanEnd := mvcc.PhysicalKeySpan()
-	machine, err := raft.NewKVStateMachine(store, spanStart, spanEnd)
+	decisionStart, decisionEnd := txn.DecisionKeySpan()
+	intentStart, intentEnd := txn.IntentKeySpan()
+	machine, err := raft.NewKVStateMachineWithSpans(store,
+		raft.KeySpan{Start: spanStart, End: spanEnd},
+		raft.KeySpan{Start: decisionStart, End: decisionEnd},
+		raft.KeySpan{Start: intentStart, End: intentEnd},
+	)
 	if err != nil {
 		return fail(err)
 	}
@@ -108,7 +118,8 @@ func OpenWithOptions(directory string, options Options) (*Engine, error) {
 	if err != nil {
 		return fail(err)
 	}
-	rangeRouter, err := ranges.Open(store, ranges.Replica{ID: 1, Store: replicated})
+	rangeRouter, err := ranges.OpenWithTransactionStore(store, replicated,
+		ranges.Replica{ID: 1, Store: replicated}, options.AdditionalReplicas...)
 	if err != nil {
 		return fail(err)
 	}

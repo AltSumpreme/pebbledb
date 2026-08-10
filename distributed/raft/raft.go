@@ -88,6 +88,12 @@ type Node struct {
 
 var raftKeyPrefix = []byte{0x00, 'p', 'd', 'b', '-', 'r', 'a', 'f', 't', 0x01}
 
+// JournalKeySpan identifies node-local Raft hard state, logs, and snapshots.
+// Range movement must never copy these keys as replicated application data.
+func JournalKeySpan() ([]byte, []byte) {
+	return append([]byte(nil), raftKeyPrefix...), codec.PrefixEnd(raftKeyPrefix)
+}
+
 const (
 	hardStateKind byte = 1
 	logKind       byte = 2

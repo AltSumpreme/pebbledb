@@ -24,8 +24,9 @@ ordered LSM store.
 - Checksummed WAL/SSTable LSM storage with Bloom filters, a bounded block cache,
   background compaction, online checkpoints, directory locking, and an explicit
   storage-format marker.
-- Durable two-phase commit decision logging and crash recovery primitives for
-  multi-range mutation integration.
+- Cross-range SQL mutations coordinated below MVCC by durable two-phase commit:
+  the system Raft group replicates decisions, range replicas stage intents, and
+  startup recovery rolls committed work forward or incomplete prepares back.
 - Durable rolling binary-upgrade coordination with per-node compatibility
   ranges, readiness acknowledgments, monotonic activation, restart recovery,
   and fail-closed rejection of old binaries.
@@ -124,7 +125,8 @@ executes one iteration of every storage/SQL benchmark. Individual targets are
 - The SQL dialect and PostgreSQL catalogs/types are a subset, not drop-in
   PostgreSQL compatibility.
 - Certificate rotation and automated restore orchestration are not implemented.
-- The durable distributed-commit component is not yet wired into the SQL range
-  mutation path, so cross-range SQL writes remain fail-closed.
+- Reopening a database with externally managed ranges requires supplying their
+  endpoints through `engine.Options.AdditionalReplicas`; automated remote node
+  discovery and transport are not implemented.
 - Placement actions expose an orchestration boundary; production-grade node
   lifecycle and Raft membership automation remain external.

@@ -104,6 +104,34 @@ func TestPrepareFailureAbortsPreparedParticipants(t *testing.T) {
 	assertNoDecisions(t, coordinatorStore)
 }
 
+func TestAbortAcknowledgementFailureRemainsRecoverable(t *testing.T) {
+	coordinatorStore := openStore(t, t.TempDir())
+	leftInner := openStore(t, t.TempDir())
+	rightInner := openStore(t, t.TempDir())
+	leftStore, _ := fault.New(leftInner)
+	rightStore, _ := fault.New(rightInner)
+	leftStore.FailAfter(fault.Delete, 0, nil)
+	rightStore.FailAfter(fault.Apply, 0, nil)
+	left := newParticipant(t, "left", leftStore)
+	right := newParticipant(t, "right", rightStore)
+	coordinator, _ := NewCoordinator(coordinatorStore)
+
+	err := coordinator.Commit(context.Background(), "txn-abort-recover", []Batch{
+		{Participant: left, Mutations: []kv.Mutation{{Key: []byte("left-key"), Value: []byte("left-value")}}},
+		{Participant: right, Mutations: []kv.Mutation{{Key: []byte("right-key"), Value: []byte("right-value")}}},
+	})
+	if !errors.Is(err, fault.ErrInjected) || !errors.Is(err, ErrInDoubt) {
+		t.Fatalf("abort acknowledgement error = %v", err)
+	}
+	outcome, err := coordinator.Resolve(context.Background(), "txn-abort-recover", map[string]*Participant{"left": left, "right": right})
+	if err != nil || outcome != Aborted {
+		t.Fatalf("resolve abort = (%v, %v), want Aborted", outcome, err)
+	}
+	assertValue(t, leftInner, "left-key", "", false)
+	assertValue(t, rightInner, "right-key", "", false)
+	assertNoDecisions(t, coordinatorStore)
+}
+
 func TestAmbiguousDecisionWriteIsRecoveredWithoutUnsafeAbort(t *testing.T) {
 	innerCoordinatorStore := openStore(t, t.TempDir())
 	injected, err := fault.New(innerCoordinatorStore)

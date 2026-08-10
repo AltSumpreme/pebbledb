@@ -6,8 +6,51 @@ import (
 	"path/filepath"
 	"testing"
 
+	"pebbledb/storage/kv"
 	"pebbledb/storage/lsm"
 )
+
+func TestKVStateMachineReplicatesAndRestoresDisjointSpans(t *testing.T) {
+	store, err := lsm.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	machine, err := NewKVStateMachineWithSpans(store,
+		KeySpan{Start: []byte("a"), End: []byte("c")},
+		KeySpan{Start: []byte("x"), End: []byte("z")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, _ := encodeRecord(mutationCommand{Mutations: []kv.Mutation{
+		{Key: []byte("b"), Value: []byte("left")},
+		{Key: []byte("y"), Value: []byte("right")},
+	}})
+	if err := machine.Apply(command); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := machine.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside, _ := encodeRecord(mutationCommand{Mutations: []kv.Mutation{{Key: []byte("m"), Value: []byte("outside")}}})
+	if err := machine.Apply(outside); err == nil {
+		t.Fatal("out-of-span command unexpectedly applied")
+	}
+	if err := store.Put([]byte("b"), []byte("changed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Restore(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for key, expected := range map[string]string{"b": "left", "y": "right"} {
+		value, found, err := store.Get([]byte(key))
+		if err != nil || !found || string(value) != expected {
+			t.Fatalf("restored %s = (%q, %v, %v)", key, value, found, err)
+		}
+	}
+}
 
 func TestElectionQuorumReplicationPartitionAndConflictRepair(t *testing.T) {
 	cluster := newTestCluster(t, 3)

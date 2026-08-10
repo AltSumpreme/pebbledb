@@ -1,10 +1,14 @@
 package ranges
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
 
+	"pebbledb/distributed/raft"
+	"pebbledb/distributed/txn"
+	"pebbledb/storage/fault"
 	"pebbledb/storage/kv"
 	"pebbledb/storage/lsm"
 )
@@ -66,7 +70,7 @@ func TestSplitRoutesDataScansAndPersistsDescriptors(t *testing.T) {
 	assertValue(t, reopened, "z", "three")
 }
 
-func TestCrossRangeBatchIsRejectedAtomically(t *testing.T) {
+func TestCrossRangeBatchCommitsAtomically(t *testing.T) {
 	metadata := openStore(t, filepath.Join(t.TempDir(), "meta"))
 	left := openStore(t, filepath.Join(t.TempDir(), "left"))
 	right := openStore(t, filepath.Join(t.TempDir(), "right"))
@@ -81,15 +85,129 @@ func TestCrossRangeBatchIsRejectedAtomically(t *testing.T) {
 		{Key: []byte("a"), Value: []byte("left")},
 		{Key: []byte("z"), Value: []byte("right")},
 	})
-	if !errors.Is(err, ErrCrossRangeBatch) {
-		t.Fatalf("batch error = %v", err)
+	if err != nil {
+		t.Fatalf("cross-range commit: %v", err)
+	}
+	assertValue(t, router, "a", "left")
+	assertValue(t, router, "z", "right")
+	reserved, _ := txn.DecisionKeySpan()
+	if err := router.Put(reserved, []byte("corrupt")); !errors.Is(err, ErrReservedKey) {
+		t.Fatalf("reserved protocol key write = %v", err)
+	}
+}
+
+func TestCrossRangePrepareFailureAbortsAndCommitFailureRecovers(t *testing.T) {
+	metadata := openStore(t, filepath.Join(t.TempDir(), "meta"))
+	left := openStore(t, filepath.Join(t.TempDir(), "left"))
+	rightStore := openStore(t, filepath.Join(t.TempDir(), "right"))
+	right, err := fault.New(rightStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := Open(metadata, Replica{ID: 1, Store: left})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := router.Split([]byte("m"), 2, Replica{ID: 2, Store: right}); err != nil {
+		t.Fatal(err)
+	}
+	right.FailAfter(fault.Apply, 0, nil)
+	err = router.Apply([]kv.Mutation{
+		{Key: []byte("a"), Value: []byte("aborted-left")},
+		{Key: []byte("z"), Value: []byte("aborted-right")},
+	})
+	if !errors.Is(err, fault.ErrInjected) {
+		t.Fatalf("prepare failure = %v, want injected error", err)
 	}
 	if _, found, _ := router.Get([]byte("a")); found {
-		t.Fatal("cross-range batch partially wrote left key")
+		t.Fatal("aborted cross-range value visible on left")
 	}
 	if _, found, _ := router.Get([]byte("z")); found {
-		t.Fatal("cross-range batch partially wrote right key")
+		t.Fatal("aborted cross-range value visible on right")
 	}
+
+	right.FailAfter(fault.Apply, 1, nil) // prepare succeeds, first commit ack fails
+	if err := router.Apply([]kv.Mutation{
+		{Key: []byte("a"), Value: []byte("recovered-left")},
+		{Key: []byte("z"), Value: []byte("recovered-right")},
+	}); err != nil {
+		t.Fatalf("recover durable commit: %v", err)
+	}
+	assertValue(t, router, "a", "recovered-left")
+	assertValue(t, router, "z", "recovered-right")
+}
+
+func TestCrossRangeCommitReplicatesDecisionsAndParticipantIntentsThroughRaft(t *testing.T) {
+	metadata := openStore(t, filepath.Join(t.TempDir(), "meta"))
+	left, leftNode := replicatedStore(t, 41)
+	right, rightNode := replicatedStore(t, 42)
+	router, err := OpenWithTransactionStore(metadata, left, Replica{ID: 1, Store: left})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := router.Split([]byte("m"), 2, Replica{ID: 2, Store: right}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Apply([]kv.Mutation{
+		{Key: []byte("a"), Value: []byte("raft-left")},
+		{Key: []byte("z"), Value: []byte("raft-right")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertValue(t, router, "a", "raft-left")
+	assertValue(t, router, "z", "raft-right")
+	if leftNode.Status().CommitIndex < 5 || rightNode.Status().CommitIndex < 2 {
+		t.Fatalf("2PC was not fully replicated: left=%+v right=%+v", leftNode.Status(), rightNode.Status())
+	}
+}
+
+func TestRouterOpenRecoversDurableCrossRangeCommit(t *testing.T) {
+	root := t.TempDir()
+	metadataPath, leftPath, rightPath := filepath.Join(root, "meta"), filepath.Join(root, "left"), filepath.Join(root, "right")
+	metadata := openStore(t, metadataPath)
+	left := openStore(t, leftPath)
+	rightStore := openStore(t, rightPath)
+	right, err := fault.New(rightStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := Open(metadata, Replica{ID: 1, Store: left})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := router.Split([]byte("m"), 2, Replica{ID: 2, Store: right}); err != nil {
+		t.Fatal(err)
+	}
+	coordinator, _ := txn.NewCoordinator(metadata)
+	leftParticipant, _ := txn.NewParticipant(participantID(1), left)
+	rightParticipant, _ := txn.NewParticipant(participantID(2), right)
+	right.FailAfter(fault.Apply, 1, nil)
+	err = coordinator.Commit(context.Background(), "crash-recovery", []txn.Batch{
+		{Participant: leftParticipant, Mutations: []kv.Mutation{{Key: []byte("a"), Value: []byte("left")}}},
+		{Participant: rightParticipant, Mutations: []kv.Mutation{{Key: []byte("z"), Value: []byte("right")}}},
+	})
+	if !errors.Is(err, txn.ErrInDoubt) {
+		t.Fatalf("interrupted commit = %v, want ErrInDoubt", err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := left.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rightStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata = openStore(t, metadataPath)
+	left = openStore(t, leftPath)
+	rightStore = openStore(t, rightPath)
+	recovered, err := Open(metadata, Replica{ID: 1, Store: left}, Replica{ID: 2, Store: rightStore})
+	if err != nil {
+		t.Fatalf("open with transaction recovery: %v", err)
+	}
+	assertValue(t, recovered, "a", "left")
+	assertValue(t, recovered, "z", "right")
 }
 
 func TestMoveAndMergePublishDurablePlacements(t *testing.T) {
@@ -166,4 +284,30 @@ func assertValue(t *testing.T, router *Router, key, expected string) {
 	if err != nil || !found || string(value) != expected {
 		t.Fatalf("get %q = (%q, %v, %v), want %q", key, value, found, err, expected)
 	}
+}
+
+func replicatedStore(t *testing.T, groupID uint64) (*raft.ReplicatedStore, *raft.Node) {
+	t.Helper()
+	journal := openStore(t, filepath.Join(t.TempDir(), "journal"))
+	data := openStore(t, filepath.Join(t.TempDir(), "data"))
+	machine, err := raft.NewKVStateMachine(data, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := raft.OpenNode(groupID, 1, journal, machine, []uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := raft.NewGroup(groupID, []*raft.Node{node}, []uint64{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := group.Elect(1); err != nil {
+		t.Fatal(err)
+	}
+	store, err := raft.NewReplicatedStore(group, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, node
 }

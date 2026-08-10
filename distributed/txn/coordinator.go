@@ -23,6 +23,25 @@ var (
 	ErrMissingMember = errors.New("distributed txn: recovery participant is unavailable")
 )
 
+type Outcome uint8
+
+const (
+	Unknown Outcome = iota
+	Aborted
+	Committed
+)
+
+// DecisionKeySpan and IntentKeySpan expose the reserved physical spans so a
+// Raft state machine can replicate protocol records without accepting unrelated
+// local metadata such as its own journal.
+func DecisionKeySpan() ([]byte, []byte) {
+	return append([]byte(nil), decisionPrefix...), codec.PrefixEnd(decisionPrefix)
+}
+
+func IntentKeySpan() ([]byte, []byte) {
+	return append([]byte(nil), intentPrefix...), codec.PrefixEnd(intentPrefix)
+}
+
 var (
 	decisionPrefix = []byte{0x00, 'p', 'd', 'b', '-', '2', 'p', 'c', '-', 'd', 0x01}
 	intentPrefix   = []byte{0x00, 'p', 'd', 'b', '-', '2', 'p', 'c', '-', 'i', 0x01}
@@ -140,6 +159,9 @@ func (coordinator *Coordinator) Commit(ctx context.Context, transactionID string
 			return coordinator.abort(transactionID, record, prepared, err)
 		}
 		if err := batch.Participant.Prepare(transactionID, batch.Mutations); err != nil {
+			// A failed durable write can be ambiguous. Include the participant in
+			// abort recovery even when Prepare did not acknowledge.
+			prepared = append(prepared, batch.Participant)
 			return coordinator.abort(transactionID, record, prepared, err)
 		}
 		prepared = append(prepared, batch.Participant)
@@ -149,15 +171,15 @@ func (coordinator *Coordinator) Commit(ctx context.Context, transactionID string
 		// The store may have made the commit decision durable even when it
 		// reports an I/O error. Never attempt to change that decision to abort;
 		// recovery will inspect the record and safely resolve either state.
-		return fmt.Errorf("%w: persist commit decision: %v", ErrInDoubt, err)
+		return fmt.Errorf("%w: persist commit decision: %w", ErrInDoubt, err)
 	}
 	for _, participant := range prepared {
 		if err := participant.Commit(transactionID); err != nil {
-			return fmt.Errorf("%w: participant %s: %v", ErrInDoubt, participant.ID(), err)
+			return fmt.Errorf("%w: participant %s: %w", ErrInDoubt, participant.ID(), err)
 		}
 	}
 	if err := coordinator.store.Delete(decisionKey(transactionID)); err != nil {
-		return fmt.Errorf("%w: remove completed decision: %v", ErrInDoubt, err)
+		return fmt.Errorf("%w: remove completed decision: %w", ErrInDoubt, err)
 	}
 	return nil
 }
@@ -171,10 +193,14 @@ func (coordinator *Coordinator) abort(transactionID string, record decisionRecor
 			abortErrors = append(abortErrors, err)
 		}
 	}
-	if decisionErr == nil && len(abortErrors) == 0 {
-		decisionErr = coordinator.store.Delete(decisionKey(transactionID))
+	cleanupErr := errors.Join(decisionErr, errors.Join(abortErrors...))
+	if cleanupErr == nil {
+		cleanupErr = coordinator.store.Delete(decisionKey(transactionID))
 	}
-	return errors.Join(cause, decisionErr, errors.Join(abortErrors...))
+	if cleanupErr != nil {
+		return errors.Join(cause, fmt.Errorf("%w: abort acknowledgements incomplete: %w", ErrInDoubt, cleanupErr))
+	}
+	return cause
 }
 
 // Recover resolves every persisted decision. PREPARING has no commit decision
@@ -198,25 +224,71 @@ func (coordinator *Coordinator) Recover(ctx context.Context, registry map[string
 		if !bytes.Equal(entry.Key, decisionKey(record.TransactionID)) {
 			return fmt.Errorf("distributed txn: decision key does not match transaction ID")
 		}
-		for _, participantID := range record.Participants {
-			participant := registry[participantID]
-			if participant == nil {
-				return fmt.Errorf("%w: %s", ErrMissingMember, participantID)
-			}
-			if record.Decision == commitDecision {
-				err = participant.Commit(record.TransactionID)
-			} else {
-				err = participant.Abort(record.TransactionID)
-			}
-			if err != nil {
-				return fmt.Errorf("distributed txn: recover %s: %w", participantID, err)
-			}
+		if _, err := coordinator.resolveRecord(ctx, record, registry); err != nil {
+			return err
 		}
 		if err := coordinator.store.Delete(entry.Key); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// Resolve recovers one known transaction and reports its durable outcome. A
+// missing decision is Unknown: it may never have existed or may already have
+// completed and been garbage-collected.
+func (coordinator *Coordinator) Resolve(ctx context.Context, transactionID string, registry map[string]*Participant) (Outcome, error) {
+	if transactionID == "" {
+		return Unknown, fmt.Errorf("distributed txn: transaction ID is required")
+	}
+	encoded, found, err := coordinator.store.Get(decisionKey(transactionID))
+	if err != nil || !found {
+		return Unknown, err
+	}
+	var record decisionRecord
+	if err := decode(encoded, &record); err != nil {
+		return Unknown, err
+	}
+	if err := validateDecisionRecord(record); err != nil {
+		return Unknown, err
+	}
+	if record.TransactionID != transactionID {
+		return Unknown, fmt.Errorf("distributed txn: decision hash collision")
+	}
+	outcome, err := coordinator.resolveRecord(ctx, record, registry)
+	if err != nil {
+		return Unknown, err
+	}
+	if err := coordinator.store.Delete(decisionKey(transactionID)); err != nil {
+		return outcome, err
+	}
+	return outcome, nil
+}
+
+func (coordinator *Coordinator) resolveRecord(ctx context.Context, record decisionRecord, registry map[string]*Participant) (Outcome, error) {
+	outcome := Aborted
+	if record.Decision == commitDecision {
+		outcome = Committed
+	}
+	for _, participantID := range record.Participants {
+		if err := ctx.Err(); err != nil {
+			return Unknown, err
+		}
+		participant := registry[participantID]
+		if participant == nil {
+			return Unknown, fmt.Errorf("%w: %s", ErrMissingMember, participantID)
+		}
+		var err error
+		if outcome == Committed {
+			err = participant.Commit(record.TransactionID)
+		} else {
+			err = participant.Abort(record.TransactionID)
+		}
+		if err != nil {
+			return Unknown, fmt.Errorf("distributed txn: recover %s: %w", participantID, err)
+		}
+	}
+	return outcome, nil
 }
 
 func (coordinator *Coordinator) putDecision(record decisionRecord) error {
