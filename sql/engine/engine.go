@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"pebbledb/catalog"
+	"pebbledb/distributed/query"
 	"pebbledb/distributed/raft"
 	"pebbledb/distributed/ranges"
 	"pebbledb/sql/ast"
@@ -260,6 +261,45 @@ func (engine *Engine) Explain(sql string) (string, error) {
 		return "", err
 	}
 	return plan.Explain(physical), nil
+}
+
+// DistributedSpans binds and optimizes one SQL statement, then exposes the
+// range-local scan fragments that a distributed coordinator will schedule.
+func (engine *Engine) DistributedSpans(sql string) ([]query.ScanSpan, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.closed {
+		return nil, fmt.Errorf("sql engine: database is closed")
+	}
+	statement, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	if engine.failed {
+		return nil, fmt.Errorf("current transaction is aborted; ROLLBACK is required")
+	}
+	transaction := engine.active
+	if transaction == nil {
+		transaction = engine.manager.Begin()
+		defer transaction.Rollback()
+	}
+	_, binderValue, _, indexes, err := engine.components(transaction)
+	if err != nil {
+		return nil, err
+	}
+	bound, err := binderValue.Bind(statement)
+	if err != nil {
+		return nil, err
+	}
+	logical, err := plan.Build(bound)
+	if err != nil {
+		return nil, err
+	}
+	physical, err := plan.Optimize(logical, indexes)
+	if err != nil {
+		return nil, err
+	}
+	return query.DeriveScanSpans(physical, engine.ranges.Descriptors())
 }
 
 // Catalog exposes an autocommit administrative catalog view.

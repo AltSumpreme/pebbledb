@@ -109,6 +109,10 @@ func TestExplainAndExecutionErrors(t *testing.T) {
 			t.Fatalf("explanation lacks %q:\n%s", expected, explanation)
 		}
 	}
+	spans, err := database.DistributedSpans("SELECT name FROM users WHERE id = 1")
+	if err != nil || len(spans) != 1 || spans[0].RangeID != 1 || len(spans[0].Start) == 0 {
+		t.Fatalf("distributed spans=%+v err=%v", spans, err)
+	}
 	if _, err := database.Execute("INSERT INTO users VALUES (1, 'A'), (1, 'B')"); err == nil {
 		t.Fatal("expected duplicate key batch to fail")
 	}

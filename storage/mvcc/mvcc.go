@@ -28,6 +28,12 @@ func PhysicalKeySpan() ([]byte, []byte) {
 	return clone(versionKeyPrefix), codec.PrefixEnd(versionKeyPrefix)
 }
 
+// PhysicalSpan maps a logical inclusive/exclusive KV span to the physical span
+// containing all of its timestamped versions.
+func PhysicalSpan(logicalStart, logicalEnd []byte) ([]byte, []byte) {
+	return versionBounds(logicalStart, logicalEnd)
+}
+
 type pendingWrite struct {
 	value  []byte
 	delete bool

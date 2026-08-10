@@ -129,9 +129,15 @@ tests for any persistent format it introduces.
      add/remove membership entries, partitions, leader replacement, follower
      catch-up, and node restart are covered by multi-node recovery tests. The
      embedded SQL engine now runs its initial range through a one-member group.
-10. **Distributed execution**
-    - Span derivation, remote processors, streaming exchange, distributed joins
-      and aggregation, cancellation, retry, and admission control.
+10. **Distributed execution (read runtime implemented)**
+    - Optimized primary, secondary, and full scans derive physical fragments at
+      current range boundaries; the SQL engine exposes these scheduled spans.
+    - Range-local endpoint tasks run through bounded streaming exchanges with
+      admission limits, cancellation, missing-node handling, and retry-before-
+      emit semantics. Streaming map/filter/project stages, equality hash joins,
+      and typed global `COUNT`/`SUM` aggregation compose over those exchanges.
+    - Cross-range mutations remain fail-closed; a recoverable distributed commit
+      protocol is still required before enabling them.
 11. **Automatic placement**
     - Replica placement, lease transfer, split/merge policy, hot-range detection,
       and rebalancing.
@@ -147,15 +153,12 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 10 introduces distributed execution and cross-range transaction
-coordination. The completed local path is:
+Milestone 11 introduces automatic placement, hot-range policy, and rebalancing.
+The completed read path is:
 
 ```text
-SQL statement -> serializable MVCC transaction
-              -> persistent range router
-              -> range-local Raft quorum
-              -> replicated atomic WAL batch
-              -> ordered LSM storage
+optimized SQL scan -> range span derivation -> admitted remote processors
+                   -> bounded exchanges -> join/aggregate -> result stream
 ```
 
 Cross-range SQL commits remain deliberately disabled until the distributed
