@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"pebbledb/distributed/raft"
 	"pebbledb/sql/engine"
 )
 
@@ -12,6 +13,9 @@ func TestEndToEndSQLAndRestart(t *testing.T) {
 	database, err := engine.Open(directory)
 	if err != nil {
 		t.Fatalf("open: %v", err)
+	}
+	if status := database.ConsensusStatus(); status.Role != raft.Leader || status.Term == 0 {
+		t.Fatalf("embedded range has no consensus leader: %+v", status)
 	}
 	results, err := database.Execute(`
         CREATE TABLE users (

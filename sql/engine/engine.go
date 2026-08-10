@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"pebbledb/catalog"
+	"pebbledb/distributed/raft"
 	"pebbledb/distributed/ranges"
 	"pebbledb/sql/ast"
 	"pebbledb/sql/binder"
@@ -23,6 +24,8 @@ import (
 type Engine struct {
 	mu         sync.Mutex
 	store      *lsm.Store
+	raftNode   *raft.Node
+	raftGroup  *raft.Group
 	ranges     *ranges.Router
 	manager    *mvcc.Manager
 	catalog    *catalog.Catalog
@@ -42,7 +45,27 @@ func Open(directory string) (*Engine, error) {
 		_ = store.Close()
 		return nil, err
 	}
-	rangeRouter, err := ranges.Open(store, ranges.Replica{ID: 1, Store: store})
+	spanStart, spanEnd := mvcc.PhysicalKeySpan()
+	machine, err := raft.NewKVStateMachine(store, spanStart, spanEnd)
+	if err != nil {
+		return fail(err)
+	}
+	raftNode, err := raft.OpenNode(1, 1, store, machine, []uint64{1})
+	if err != nil {
+		return fail(err)
+	}
+	raftGroup, err := raft.NewGroup(1, []*raft.Node{raftNode}, []uint64{1})
+	if err != nil {
+		return fail(err)
+	}
+	if err := raftGroup.Elect(1); err != nil {
+		return fail(err)
+	}
+	replicated, err := raft.NewReplicatedStore(raftGroup, store)
+	if err != nil {
+		return fail(err)
+	}
+	rangeRouter, err := ranges.Open(store, ranges.Replica{ID: 1, Store: replicated})
 	if err != nil {
 		return fail(err)
 	}
@@ -60,6 +83,8 @@ func Open(directory string) (*Engine, error) {
 	}
 	return &Engine{
 		store:      store,
+		raftNode:   raftNode,
+		raftGroup:  raftGroup,
 		ranges:     rangeRouter,
 		manager:    manager,
 		catalog:    catalogValue,
@@ -243,6 +268,9 @@ func (engine *Engine) Catalog() *catalog.Catalog { return engine.catalog }
 // Ranges exposes a read-mostly routing view for diagnostics and administrative
 // split orchestration.
 func (engine *Engine) Ranges() *ranges.Router { return engine.ranges }
+
+// ConsensusStatus reports the local member of the default range's Raft group.
+func (engine *Engine) ConsensusStatus() raft.Status { return engine.raftNode.Status() }
 
 func (engine *Engine) Close() error {
 	engine.mu.Lock()

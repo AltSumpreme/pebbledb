@@ -121,9 +121,14 @@ tests for any persistent format it introduces.
    - Splits copy the future right-hand span before atomically publishing both
      descriptors, then clean obsolete source copies. A multi-LSM harness covers
      boundary routing, data movement, stale clients, restart, and corruption.
-9. **Raft replication**
-   - One consensus group per range, replicated commands/snapshots, membership
-     changes, and quorum recovery tests.
+9. **Raft replication (implemented)**
+   - Each range can be backed by an independent durable Raft group with
+     persisted terms, votes, checksummed logs, RequestVote elections, log
+     matching/conflict repair, majority commit, and linearizable read barriers.
+   - Replicated KV command batches, snapshot creation/installation, serialized
+     add/remove membership entries, partitions, leader replacement, follower
+     catch-up, and node restart are covered by multi-node recovery tests. The
+     embedded SQL engine now runs its initial range through a one-member group.
 10. **Distributed execution**
     - Span derivation, remote processors, streaming exchange, distributed joins
       and aggregation, cancellation, retry, and admission control.
@@ -142,13 +147,14 @@ developed earlier as an adapter once stable session and result interfaces exist.
 
 ## Next implementation slice
 
-Milestone 9 introduces replicated range state machines and quorum consensus. The
-completed local path is:
+Milestone 10 introduces distributed execution and cross-range transaction
+coordination. The completed local path is:
 
 ```text
 SQL statement -> serializable MVCC transaction
               -> persistent range router
-              -> one range-local atomic WAL batch
+              -> range-local Raft quorum
+              -> replicated atomic WAL batch
               -> ordered LSM storage
 ```
 

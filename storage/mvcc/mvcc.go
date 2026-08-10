@@ -22,6 +22,12 @@ var (
 
 var versionKeyPrefix = []byte{0x00, 'p', 'd', 'b', '-', 'm', 'v', 'c', 'c', 0x01}
 
+// PhysicalKeySpan returns the reserved storage span containing MVCC versions.
+// Replication and range layers use it without interpreting version keys.
+func PhysicalKeySpan() ([]byte, []byte) {
+	return clone(versionKeyPrefix), codec.PrefixEnd(versionKeyPrefix)
+}
+
 type pendingWrite struct {
 	value  []byte
 	delete bool
