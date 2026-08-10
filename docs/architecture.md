@@ -100,9 +100,13 @@ tests for any persistent format it introduces.
    - End-to-end SQL engine, typed expression evaluation with SQL NULL logic,
      restart persistence, multi-row validation, and `EXPLAIN` output that exposes
      operators/access paths without leaking WAL or SSTable internals.
-6. **Indexes**
-   - Primary and secondary index maintenance, uniqueness checks, index scans,
-     statistics, and initial cost-based access-path selection.
+6. **Indexes (implemented)**
+   - Ordered primary lookups and maintained unique/non-unique secondary index
+     entries with PostgreSQL-style multiple-NULL uniqueness, multi-row preflight,
+     backfill validation/rollback, and UPDATE/DELETE maintenance.
+   - Exact entry/distinct statistics and an initial optimizer that selects
+     primary-key or selective single-column equality scans; chosen paths and
+     index names appear in `EXPLAIN`.
 7. **MVCC and transactions**
    - Timestamped row/index versions, snapshots, intents, atomic write batches,
      conflict handling, recovery, and serializable validation.

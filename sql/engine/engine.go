@@ -10,6 +10,7 @@ import (
 	"pebbledb/sql/executor"
 	"pebbledb/sql/parser"
 	"pebbledb/sql/plan"
+	"pebbledb/storage/indexstore"
 	"pebbledb/storage/lsm"
 	"pebbledb/storage/rowstore"
 )
@@ -19,6 +20,7 @@ type Engine struct {
 	catalog  *catalog.Catalog
 	binder   *binder.Binder
 	executor *executor.Executor
+	indexes  *indexstore.Store
 }
 
 func Open(directory string) (*Engine, error) {
@@ -46,11 +48,15 @@ func Open(directory string) (*Engine, error) {
 	if err != nil {
 		return fail(err)
 	}
-	executorValue, err := executor.New(catalogValue, rows)
+	indexes, err := indexstore.New(store)
 	if err != nil {
 		return fail(err)
 	}
-	return &Engine{store: store, catalog: catalogValue, binder: binderValue, executor: executorValue}, nil
+	executorValue, err := executor.New(catalogValue, rows, indexes)
+	if err != nil {
+		return fail(err)
+	}
+	return &Engine{store: store, catalog: catalogValue, binder: binderValue, executor: executorValue, indexes: indexes}, nil
 }
 
 // Execute parses and executes one or more semicolon-separated SQL statements in
@@ -71,7 +77,7 @@ func (engine *Engine) Execute(sql string) ([]executor.Result, error) {
 		if err != nil {
 			return results, fmt.Errorf("statement %d plan: %w", index+1, err)
 		}
-		physical, err := plan.Physicalize(logical)
+		physical, err := plan.Optimize(logical, engine.indexes)
 		if err != nil {
 			return results, fmt.Errorf("statement %d physical plan: %w", index+1, err)
 		}
@@ -97,7 +103,7 @@ func (engine *Engine) Explain(sql string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	physical, err := plan.Physicalize(logical)
+	physical, err := plan.Optimize(logical, engine.indexes)
 	if err != nil {
 		return "", err
 	}

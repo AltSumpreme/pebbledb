@@ -8,6 +8,7 @@ import (
 	"pebbledb/catalog"
 	"pebbledb/codec"
 	"pebbledb/sql/binder"
+	"pebbledb/types"
 )
 
 type Kind string
@@ -48,21 +49,31 @@ type LogicalPlan struct{ Root *LogicalNode }
 
 type AccessPath string
 
-const FullTableScan AccessPath = "full-table-scan"
+const (
+	FullTableScan      AccessPath = "full-table-scan"
+	PrimaryKeyLookup   AccessPath = "primary-key-lookup"
+	SecondaryIndexScan AccessPath = "secondary-index-scan"
+)
+
+type StatsProvider interface {
+	IndexStats(table catalog.TableDescriptor, index catalog.IndexDescriptor) (entries uint64, distinct uint64, err error)
+}
 
 type PhysicalNode struct {
-	Kind        Kind
-	Input       *PhysicalNode
-	Right       *PhysicalNode
-	Table       catalog.TableDescriptor
-	Access      AccessPath
-	Expression  *binder.Expression
-	Projection  []binder.Projection
-	Ordering    []binder.Ordering
-	Limit       *int64
-	Rows        []codec.Row
-	Assignments []binder.Assignment
-	Statement   binder.Statement
+	Kind         Kind
+	Input        *PhysicalNode
+	Right        *PhysicalNode
+	Table        catalog.TableDescriptor
+	Access       AccessPath
+	Index        *catalog.IndexDescriptor
+	LookupValues []types.Value
+	Expression   *binder.Expression
+	Projection   []binder.Projection
+	Ordering     []binder.Ordering
+	Limit        *int64
+	Rows         []codec.Row
+	Assignments  []binder.Assignment
+	Statement    binder.Statement
 }
 
 type PhysicalPlan struct{ Root *PhysicalNode }
@@ -135,10 +146,23 @@ func Build(statement binder.Statement) (LogicalPlan, error) {
 // Physicalize selects the initial physical access path. Milestone 6 replaces
 // FullTableScan when a compatible primary or secondary index span exists.
 func Physicalize(logical LogicalPlan) (PhysicalPlan, error) {
+	return Optimize(logical, nil)
+}
+
+// Optimize chooses equality lookup paths using catalog keys and current index
+// cardinality. Primary-key equality always wins; otherwise the most selective
+// eligible single-column secondary index is chosen.
+func Optimize(logical LogicalPlan, statistics StatsProvider) (PhysicalPlan, error) {
 	if logical.Root == nil {
 		return PhysicalPlan{}, fmt.Errorf("sql plan: logical plan has no root")
 	}
-	return PhysicalPlan{Root: physicalizeNode(logical.Root)}, nil
+	physical := PhysicalPlan{Root: physicalizeNode(logical.Root)}
+	candidates := make(map[catalog.DescriptorID][]lookupCandidate)
+	collectCandidates(physical.Root, candidates)
+	if err := chooseAccessPaths(physical.Root, candidates, statistics); err != nil {
+		return PhysicalPlan{}, err
+	}
+	return physical, nil
 }
 
 func physicalizeNode(logical *LogicalNode) *PhysicalNode {
@@ -158,6 +182,93 @@ func physicalizeNode(logical *LogicalNode) *PhysicalNode {
 	return physical
 }
 
+type lookupCandidate struct {
+	columnID uint32
+	value    types.Value
+}
+
+func collectCandidates(node *PhysicalNode, candidates map[catalog.DescriptorID][]lookupCandidate) {
+	if node == nil {
+		return
+	}
+	if node.Kind == FilterKind {
+		collectExpressionCandidates(node.Expression, candidates)
+	}
+	collectCandidates(node.Input, candidates)
+	collectCandidates(node.Right, candidates)
+}
+
+func collectExpressionCandidates(expression *binder.Expression, candidates map[catalog.DescriptorID][]lookupCandidate) {
+	if expression == nil || expression.Kind != binder.BinaryExpression {
+		return
+	}
+	if expression.Operator == "AND" {
+		for _, argument := range expression.Arguments {
+			collectExpressionCandidates(argument, candidates)
+		}
+		return
+	}
+	if expression.Operator != "=" || len(expression.Arguments) != 2 {
+		return
+	}
+	left, right := expression.Arguments[0], expression.Arguments[1]
+	if left.Kind == binder.LiteralExpression && right.Kind == binder.ColumnExpression {
+		left, right = right, left
+	}
+	if left.Kind != binder.ColumnExpression || right.Kind != binder.LiteralExpression || right.Literal.IsNull() {
+		return
+	}
+	candidates[left.TableID] = append(candidates[left.TableID], lookupCandidate{columnID: left.ColumnID, value: right.Literal})
+}
+
+func chooseAccessPaths(node *PhysicalNode, candidates map[catalog.DescriptorID][]lookupCandidate, statistics StatsProvider) error {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == ScanKind {
+		for _, candidate := range candidates[node.Table.ID] {
+			if len(node.Table.Schema.PrimaryKey) == 1 && node.Table.Schema.PrimaryKey[0] == candidate.columnID {
+				node.Access = PrimaryKeyLookup
+				node.LookupValues = []types.Value{candidate.value}
+				return nil
+			}
+		}
+		bestCost := ^uint64(0)
+		for _, candidate := range candidates[node.Table.ID] {
+			for indexPosition := range node.Table.Indexes {
+				index := node.Table.Indexes[indexPosition]
+				if len(index.ColumnIDs) != 1 || index.ColumnIDs[0] != candidate.columnID {
+					continue
+				}
+				cost := uint64(1)
+				if statistics != nil {
+					entries, distinct, err := statistics.IndexStats(node.Table, index)
+					if err != nil {
+						return err
+					}
+					if distinct > 0 {
+						cost = entries / distinct
+						if cost == 0 {
+							cost = 1
+						}
+					}
+				}
+				if cost < bestCost {
+					indexCopy := index
+					node.Access = SecondaryIndexScan
+					node.Index = &indexCopy
+					node.LookupValues = []types.Value{candidate.value}
+					bestCost = cost
+				}
+			}
+		}
+	}
+	if err := chooseAccessPaths(node.Input, candidates, statistics); err != nil {
+		return err
+	}
+	return chooseAccessPaths(node.Right, candidates, statistics)
+}
+
 func Explain(plan PhysicalPlan) string {
 	var result strings.Builder
 	explainNode(&result, plan.Root, 0)
@@ -175,6 +286,9 @@ func explainNode(result *strings.Builder, node *PhysicalNode, depth int) {
 	}
 	if node.Access != "" {
 		fmt.Fprintf(result, " access=%s", node.Access)
+	}
+	if node.Index != nil {
+		fmt.Fprintf(result, " index=%s", node.Index.Name)
 	}
 	if node.Limit != nil {
 		fmt.Fprintf(result, " rows=%d", *node.Limit)

@@ -8,6 +8,7 @@ import (
 	"pebbledb/codec"
 	"pebbledb/sql/binder"
 	"pebbledb/sql/plan"
+	"pebbledb/storage/indexstore"
 	"pebbledb/storage/rowstore"
 	"pebbledb/types"
 	"sort"
@@ -31,13 +32,14 @@ type Executor struct {
 	mu      sync.Mutex
 	catalog *catalog.Catalog
 	rows    *rowstore.Store
+	indexes *indexstore.Store
 }
 
-func New(catalogValue *catalog.Catalog, rows *rowstore.Store) (*Executor, error) {
-	if catalogValue == nil || rows == nil {
-		return nil, fmt.Errorf("sql executor: catalog and row store are required")
+func New(catalogValue *catalog.Catalog, rows *rowstore.Store, indexes *indexstore.Store) (*Executor, error) {
+	if catalogValue == nil || rows == nil || indexes == nil {
+		return nil, fmt.Errorf("sql executor: catalog, row store, and index store are required")
 	}
-	return &Executor{catalog: catalogValue, rows: rows}, nil
+	return &Executor{catalog: catalogValue, rows: rows, indexes: indexes}, nil
 }
 
 func (executor *Executor) Execute(physical plan.PhysicalPlan) (Result, error) {
@@ -122,7 +124,7 @@ type cellKey struct {
 func (executor *Executor) executeOperator(node *plan.PhysicalNode) ([]record, error) {
 	switch node.Kind {
 	case plan.ScanKind:
-		stored, err := executor.rows.Scan(node.Table)
+		stored, err := executor.scan(node)
 		if err != nil {
 			return nil, err
 		}
@@ -264,6 +266,9 @@ func (executor *Executor) executeOperator(node *plan.PhysicalNode) ([]record, er
 }
 
 func (executor *Executor) insert(statement binder.Insert) error {
+	if err := executor.indexes.CheckBatch(statement.Table, statement.Rows); err != nil {
+		return err
+	}
 	keys := make(map[string]struct{}, len(statement.Rows))
 	for _, row := range statement.Rows {
 		key, err := rowstore.KeyFromRow(statement.Table, row)
@@ -283,6 +288,10 @@ func (executor *Executor) insert(statement binder.Insert) error {
 	}
 	for _, row := range statement.Rows {
 		if err := executor.rows.Insert(statement.Table, row); err != nil {
+			return err
+		}
+		if err := executor.indexes.Add(statement.Table, row); err != nil {
+			_ = executor.rows.Delete(statement.Table, row)
 			return err
 		}
 	}
@@ -321,7 +330,20 @@ func (executor *Executor) update(node *plan.PhysicalNode) (int64, error) {
 			}
 			updated.Values[assignment.ColumnID] = value
 		}
+		oldPrimary := primaryValues(node.Table, current.Row)
+		if err := executor.indexes.Check(node.Table, updated, oldPrimary); err != nil {
+			return affected, err
+		}
+		if err := executor.indexes.Remove(node.Table, current.Row); err != nil {
+			return affected, err
+		}
 		if err := executor.rows.Replace(node.Table, updated); err != nil {
+			_ = executor.indexes.Add(node.Table, current.Row)
+			return affected, err
+		}
+		if err := executor.indexes.Add(node.Table, updated); err != nil {
+			_ = executor.rows.Replace(node.Table, current.Row)
+			_ = executor.indexes.Add(node.Table, current.Row)
 			return affected, err
 		}
 		affected++
@@ -341,7 +363,11 @@ func (executor *Executor) delete(node *plan.PhysicalNode) (int64, error) {
 			return affected, err
 		}
 		if matches {
+			if err := executor.indexes.Remove(node.Table, current.Row); err != nil {
+				return affected, err
+			}
 			if err := executor.rows.Delete(node.Table, current.Row); err != nil {
+				_ = executor.indexes.Add(node.Table, current.Row)
 				return affected, err
 			}
 			affected++
@@ -370,16 +396,78 @@ func (executor *Executor) create(statement binder.Statement) (string, error) {
 					columnName = column.Name
 				}
 			}
-			if _, err := executor.catalog.AddIndex(table.ID, value.Name+"_"+columnName+"_key", []uint32{columnID}, true); err != nil {
+			updated, err := executor.catalog.AddIndex(table.ID, value.Name+"_"+columnName+"_key", []uint32{columnID}, true)
+			if err != nil {
 				return "", err
 			}
+			index := updated.Indexes[len(updated.Indexes)-1]
+			if err := executor.indexes.Backfill(updated, index, nil); err != nil {
+				_, _ = executor.catalog.DropIndex(updated.ID, index.ID)
+				return "", err
+			}
+			table = updated
 		}
 		return "CREATE TABLE", nil
 	case binder.CreateIndex:
-		_, err := executor.catalog.AddIndex(value.Table.ID, value.Name, value.ColumnIDs, value.Unique)
-		return "CREATE INDEX", err
+		updated, err := executor.catalog.AddIndex(value.Table.ID, value.Name, value.ColumnIDs, value.Unique)
+		if err != nil {
+			return "CREATE INDEX", err
+		}
+		index := updated.Indexes[len(updated.Indexes)-1]
+		stored, err := executor.rows.Scan(updated)
+		if err != nil {
+			_, _ = executor.catalog.DropIndex(updated.ID, index.ID)
+			return "CREATE INDEX", err
+		}
+		rows := make([]codec.Row, len(stored))
+		for position := range stored {
+			rows[position] = stored[position].Row
+		}
+		if err := executor.indexes.Backfill(updated, index, rows); err != nil {
+			_, _ = executor.catalog.DropIndex(updated.ID, index.ID)
+			return "CREATE INDEX", err
+		}
+		return "CREATE INDEX", nil
 	default:
 		return "", fmt.Errorf("sql executor: unsupported CREATE %T", statement)
+	}
+}
+
+func (executor *Executor) scan(node *plan.PhysicalNode) ([]rowstore.StoredRow, error) {
+	switch node.Access {
+	case plan.PrimaryKeyLookup:
+		row, err := executor.rows.Get(node.Table, node.LookupValues)
+		if errors.Is(err, rowstore.ErrRowNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		key, err := rowstore.KeyFromRow(node.Table, row)
+		return []rowstore.StoredRow{{Key: key, Row: row}}, err
+	case plan.SecondaryIndexScan:
+		if node.Index == nil {
+			return nil, fmt.Errorf("sql executor: secondary index scan has no index")
+		}
+		primaryKeys, err := executor.indexes.Lookup(node.Table, *node.Index, node.LookupValues)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]rowstore.StoredRow, 0, len(primaryKeys))
+		for _, primary := range primaryKeys {
+			row, err := executor.rows.Get(node.Table, primary)
+			if err != nil {
+				return nil, err
+			}
+			key, err := rowstore.KeyFromRow(node.Table, row)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, rowstore.StoredRow{Key: key, Row: row})
+		}
+		return result, nil
+	default:
+		return executor.rows.Scan(node.Table)
 	}
 }
 

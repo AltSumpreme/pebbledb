@@ -312,6 +312,28 @@ func (catalog *Catalog) AddIndex(tableID DescriptorID, name string, columnIDs []
 	return catalog.storeTableLocked(table)
 }
 
+func (catalog *Catalog) DropIndex(tableID, indexID DescriptorID) (TableDescriptor, error) {
+	catalog.mu.Lock()
+	defer catalog.mu.Unlock()
+	table, err := catalog.getTableByIDLocked(tableID)
+	if err != nil {
+		return TableDescriptor{}, err
+	}
+	position := -1
+	for index := range table.Indexes {
+		if table.Indexes[index].ID == indexID {
+			position = index
+			break
+		}
+	}
+	if position < 0 {
+		return TableDescriptor{}, fmt.Errorf("%w: index ID %d", ErrNotFound, indexID)
+	}
+	table.Indexes = append(table.Indexes[:position], table.Indexes[position+1:]...)
+	table.Version++
+	return catalog.storeTableLocked(table)
+}
+
 func (catalog *Catalog) AddConstraint(tableID DescriptorID, constraint ConstraintDescriptor) (TableDescriptor, error) {
 	normalized, err := normalizeName(constraint.Name)
 	if err != nil {
